@@ -1,3 +1,8 @@
+"""Deprecated compatibility workflow.
+
+The API main path uses travel_agent.agent.travel_graph.unified_graph.
+"""
+
 from __future__ import annotations
 
 from travel_agent.agent.executor import ExecutorNode

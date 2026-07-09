@@ -1,3 +1,5 @@
+"""Deprecated planner node kept for compatibility with the old workflow."""
+
 from __future__ import annotations
 
 import re

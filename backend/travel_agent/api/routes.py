@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from travel_agent.api.chat import router as chat_router
+from .chat import router as chat_router
 from travel_agent.models.travel import TravelPlanRequest, TravelPlanResponse
 from travel_agent.services.travel_planner import TencentMapsError, build_travel_plan
 

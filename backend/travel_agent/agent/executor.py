@@ -1,3 +1,5 @@
+"""Deprecated executor node kept for compatibility with the old workflow."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

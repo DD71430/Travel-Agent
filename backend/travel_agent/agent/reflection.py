@@ -1,3 +1,5 @@
+"""Deprecated reflection node kept for compatibility with the old workflow."""
+
 from __future__ import annotations
 
 from travel_agent.agent.state import AgentState

@@ -32,7 +32,11 @@ class Settings(BaseSettings):
     redis_prefix: str = Field(...)
     memory_ttl_seconds: int = Field(...)
     cors_origins_raw: str = Field(default='http://localhost:5174,http://127.0.0.1:5174,http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000', alias='CORS_ORIGINS')
-    debug: bool = Field(default=True, alias='DEBUG')
+    debug: bool = Field(default=False, alias='DEBUG')
+    max_upload_bytes: int = Field(default=10 * 1024 * 1024, alias='MAX_UPLOAD_BYTES')
+    max_extract_chars: int = Field(default=4000, alias='MAX_EXTRACT_CHARS')
+    return_debug_meta: bool = Field(default=False, alias='RETURN_DEBUG_META')
+    ffmpeg_path: str = Field(default='', alias='FFMPEG_PATH')
 
     @property
     def cors_origins(self) -> list[str]:

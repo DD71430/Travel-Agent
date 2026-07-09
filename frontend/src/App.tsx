@@ -271,7 +271,7 @@ function getDataSourceLabel(value?: string) {
 function createQuickPrompt(mode: 'travel' | 'nearby') {
   const prompts = {
     travel: '帮我规划一个三天两晚的旅行路线，优先经典景点和合理游览节奏',
-    nearby: '推荐     附近的酒店、餐厅和景点',
+    nearby: '推荐北京故宫附近的酒店、餐厅和景点',
   }
   return prompts[mode]
 }
@@ -302,7 +302,6 @@ function PlanCard({ plan }: { plan: TravelPlanResponse }) {
         <div><span>意图</span><strong>{plan.intent}</strong></div>
         <div><span>场景</span><strong>{plan.scenario}</strong></div>
         <div><span>天数</span><strong>{plan.duration_days || '--'} 天</strong></div>
-        <div><span>天气策略</span><strong>{plan.weather_hint || '以出行前最新天气为准'}</strong></div>
         <div><span>天气参考</span><strong>{plan.weather_hint || '以出行前最新天气为准'}</strong></div>
       </div>
 
@@ -479,15 +478,12 @@ export default function App() {
     setUploadKind((uploadContext.file_kind as 'image' | 'audio' | 'other' | '') || '')
     if (uploadContext.file_kind === 'audio') {
       setAudioDebug((uploadContext.audio_debug as AudioDebugPanel | undefined) || null)
-      if (uploadContext.audio_debug) {
+      if (import.meta.env.DEV && uploadContext.audio_debug) {
         const debugText = Object.entries(uploadContext.audio_debug)
           .filter(([, value]) => value !== undefined && value !== null && value !== '')
           .map(([key, value]) => `${key}: ${typeof value === 'object' ? JSON.stringify(value) : String(value)}`)
           .join('\n')
         setLastAudioDebugText(debugText)
-        if (debugText) {
-          setUploadPreview(debugText)
-        }
       }
       if (uploadContext.extracted_text) {
         setUploadError('')
@@ -825,7 +821,7 @@ export default function App() {
                 <span>{upload ? `已选${uploadKind === 'audio' ? '语音文件' : uploadKind === 'image' ? '图片文件' : '文件'}：${upload.name}` : '上传图片、文档、PDF 或语音文件后将根据内容回答'}</span>
               </label>
 
-              {uploadKind === 'audio' && (uploadPreview || lastAudioDebugText) ? (
+              {import.meta.env.DEV && uploadKind === 'audio' && (uploadPreview || lastAudioDebugText) ? (
                 <div className="debug-box">
                   <strong>语音调试信息</strong>
                   <pre>{uploadPreview || lastAudioDebugText}</pre>

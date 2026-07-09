@@ -7,8 +7,10 @@ from travel_agent.models.travel import (
     UnifiedChatResponse,
     UnifiedResponseData,
 )
+from travel_agent.schemas.chat import ChatRequest
 
 __all__ = [
+    'ChatRequest',
     'ConversationTurn',
     'RouteOption',
     'RouteStep',

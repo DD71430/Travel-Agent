@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import defaultdict, deque
 from typing import Any
 from uuid import uuid4
 
@@ -8,6 +7,8 @@ import httpx
 import re
 
 from travel_agent.core.config import get_settings
+from travel_agent.core.logging import get_logger
+from travel_agent.memory.redis_memory import RedisMemoryStore
 from travel_agent.models.travel import (
     ConversationTurn,
     RouteOption,
@@ -19,8 +20,8 @@ from travel_agent.models.travel import (
 from travel_agent.tools.tencent_webservice_client import TencentWebServiceClient, TencentWebServiceError
 
 settings = get_settings()
-_history_store: dict[str, deque[ConversationTurn]] = defaultdict(lambda: deque(maxlen=10))
-_preference_store: dict[str, list[str]] = defaultdict(list)
+logger = get_logger(__name__)
+memory_store = RedisMemoryStore()
 _client = TencentWebServiceClient()
 
 
@@ -1331,8 +1332,17 @@ def build_travel_plan(request: TravelPlanRequest) -> TravelPlanResponse:
     intent = _classify_intent(f"{request.origin} {request.destination} {request.preferences or ''} {request.source_query or ''}")
     scenario = _classify_scenario(request)
     preferences = _extract_preferences(request)
+    memory_context = memory_store.get_context(conversation_id)
+    long_term = memory_context.get('long_term', {}) if isinstance(memory_context, dict) else {}
+    stored_preferences = long_term.get('travel_preferences', [])
+    if not isinstance(stored_preferences, list):
+        stored_preferences = []
+    user_preferences = list(stored_preferences)
+    for pref in preferences:
+        if pref not in user_preferences:
+            user_preferences.append(pref)
+    memory_store.update_profile(conversation_id, {'travel_preferences': user_preferences})
     profile = _extract_trip_profile(request)
-    _preference_store[conversation_id].extend(pref for pref in preferences if pref not in _preference_store[conversation_id])
     route_options, data_source, route_error, location_debug = _fetch_tencent_route_options(request, scenario)
     best_option = _choose_best_option(route_options, request)
     route_issues = _validate_route_reasonableness(best_option, request)
@@ -1364,7 +1374,12 @@ def build_travel_plan(request: TravelPlanRequest) -> TravelPlanResponse:
         food_candidates,
     )
     daily_itinerary = _build_trip_itinerary(request, profile, best_option, attraction_recommendations, weather_hint, hotel_candidates, food_candidates)
-    history = _history_store[conversation_id]
+    short_term = memory_context.get('short_term', []) if isinstance(memory_context, dict) else []
+    history = [
+        ConversationTurn(user_input=str(item.get('user_input') or ''), assistant_output=str(item.get('assistant_output') or ''))
+        for item in short_term[-10:]
+        if isinstance(item, dict)
+    ]
     history.append(ConversationTurn(user_input=f'{request.origin} -> {request.destination}', assistant_output=summary))
     confidence = _route_quality_label(best_option.distance, best_option.duration, request) if data_source == 'tencent_maps' and not route_issues else 'low'
     if route_issues:
@@ -1389,7 +1404,7 @@ def build_travel_plan(request: TravelPlanRequest) -> TravelPlanResponse:
         route_steps=best_option.steps,
         route_options=route_options,
         recommendation_reasons=best_option.reasons,
-        user_preferences=_preference_store[conversation_id],
+        user_preferences=user_preferences,
         history=list(history),
         raw_route={
             'provider': 'tencent_maps' if data_source == 'tencent_maps' else 'fallback',
