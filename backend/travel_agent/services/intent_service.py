@@ -3,10 +3,12 @@ from __future__ import annotations
 import re
 from typing import Literal
 
-NEARBY_KEYWORDS = ('附近', '周边', '酒店', '餐厅', '美食', '景点', '博物馆', '公园', '商场', '推荐')
+NEARBY_KEYWORDS = ('附近', '周边', '周围', '旁边', '临近', '靠近')
 CITY_HINTS = ('北京', '上海', '广州', '深圳', '杭州', '济南', '南京', '苏州', '成都', '重庆', '武汉', '西安', '天津', '青岛', '厦门', '长沙', '郑州', '合肥', '福州', '昆明', '哈尔滨', '大连', '宁波', '无锡', '佛山', '东莞', '烟台', '珠海', '南昌', '徐州', '泰安', '德州', '曲阜')
 
 _LOCATION_PATTERNS = [
+    r'从(?P<origin>[^，。；,]+?)(?:自驾|驾车|开车|公交|公共交通|地铁|骑行|步行|徒步)?到(?P<destination>[^，。；,]+)',
+    r'从(?P<origin>[^，。；,]+?)(?:自驾|驾车|开车|公交|公共交通|地铁|骑行|步行|徒步)?去(?P<destination>[^，。；,]+)',
     r'从(?P<origin>[^，。；,]+?)到(?P<destination>[^，。；,]+)',
     r'从(?P<origin>[^，。；,]+?)去(?P<destination>[^，。；,]+)',
     r'(?P<origin>[^，。；,]+?)到(?P<destination>[^，。；,]+)',
@@ -33,6 +35,7 @@ def clean_location(value: str) -> str:
     text = strip_common_noise(value.strip().strip('，。；,！？ '))
     text = text.replace('从', '').replace('去', '').replace('到', '')
     text = text.replace('→', '').replace('->', '').replace('-->', '').strip()
+    text = re.sub(r'(自驾|驾车|开车|公交|公共交通|地铁|骑行|步行|徒步)$', '', text).strip()
     text = re.sub(r'进行为期.*$', '', text).strip()
     text = re.sub(r'的\d+\s*天.*$', '', text).strip()
     text = re.sub(r'\d+\s*天.*$', '', text).strip()
@@ -45,14 +48,16 @@ def clean_location(value: str) -> str:
 
 
 def extract_locations(question: str) -> tuple[str | None, str | None]:
-    cleaned_text = _LOCATION_TRAILING_PATTERN.sub('', strip_common_noise(question.strip())).strip()
-    for pattern in _LOCATION_PATTERNS:
-        match = re.search(pattern, cleaned_text)
-        if match:
-            origin = clean_location(match.group('origin'))
-            destination = clean_location(match.group('destination'))
-            if origin and destination:
-                return origin, destination
+    raw_text = strip_common_noise(question.strip())
+    for candidate_text in (raw_text, _LOCATION_TRAILING_PATTERN.sub('', raw_text).strip()):
+        for pattern in _LOCATION_PATTERNS:
+            match = re.search(pattern, candidate_text)
+            if match:
+                origin = clean_location(match.group('origin'))
+                destination = clean_location(match.group('destination'))
+                if origin and destination:
+                    return origin, destination
+    cleaned_text = _LOCATION_TRAILING_PATTERN.sub('', raw_text).strip()
     for separator in ('到', '去', '→'):
         if separator in cleaned_text and len(cleaned_text.split(separator)) == 2:
             origin, destination = cleaned_text.split(separator, 1)
@@ -163,12 +168,16 @@ def classify_chat_intent(question: str) -> Literal['general_chat', 'travel_plann
         return 'general_chat'
     parsed_origin, parsed_destination = extract_locations(question)
     trip_details = extract_trip_details(question)
-    if any(keyword in question for keyword in NEARBY_KEYWORDS):
-        return 'nearby_search'
+    travel_markers = (*_TRAVEL_NOISE_WORDS, '路线', '路书', '攻略', '怎么去', '怎么走', '出发', '目的地', '途经', '一日游', '两天一晚', '三天两晚', '经典景点', '游览节奏')
     if parsed_origin and parsed_destination:
         return 'travel_planning'
+    if any(trip_details.values()) and any(keyword in question for keyword in travel_markers):
+        return 'travel_planning'
+    nearby_target_markers = ('酒店', '餐厅', '美食', '景点', '博物馆', '公园', '商场', '推荐', '民宿', '宾馆')
+    if any(keyword in question for keyword in NEARBY_KEYWORDS) and any(keyword in question for keyword in nearby_target_markers):
+        return 'nearby_search'
     if any(trip_details.values()):
         return 'travel_planning'
-    if any(keyword in question for keyword in (*_TRAVEL_NOISE_WORDS, '路线', '路书', '攻略', '怎么去', '怎么走', '出发', '目的地', '途经', '一日游', '两天一晚', '三天两晚')):
+    if any(keyword in question for keyword in travel_markers):
         return 'travel_planning'
     return 'general_chat'

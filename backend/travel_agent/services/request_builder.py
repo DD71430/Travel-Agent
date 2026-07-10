@@ -13,6 +13,7 @@ from travel_agent.services.intent_service import (
     extract_trip_details,
     extract_weather_preferences,
 )
+from travel_agent.services.trip_profile_service import build_trip_profile_from_text
 
 
 def build_preference_summary(question: str, existing_preferences: str | None, travel_mode: str, trip_details: dict[str, str | None]) -> str:
@@ -82,11 +83,17 @@ def build_travel_request(request: ChatRequest) -> TravelPlanRequest:
     preference_text = (request.preferences or '').strip()
     question_text = request.question or ''
     merged_preference_text = '；'.join(part for part in [preference_text, question_text] if part)
+    parsed_profile = build_trip_profile_from_text(merged_preference_text, origin=origin, destination=destination, travel_mode=travel_mode)
     trip_profile = {
-        'duration_days': int(trip_details['duration_days']) if trip_details['duration_days'] else None,
+        'duration_days': parsed_profile.get('duration_days') or (int(trip_details['duration_days']) if trip_details['duration_days'] else None),
+        'nights': parsed_profile.get('nights'),
         'budget': trip_details['budget'],
         'travel_style': '轻松慢游' if any(word in merged_preference_text for word in ('轻松', '慢游', '休闲', '不赶')) else '常规游玩',
         'companions': '家庭/朋友' if any(word in merged_preference_text for word in ('家人', '家庭', '朋友', '亲子')) else '默认',
+        'interest_tags': parsed_profile.get('interest_tags', []),
+        'avoid_tags': parsed_profile.get('avoid_tags', []),
+        'pace': parsed_profile.get('pace', 'normal'),
+        'trip_type': parsed_profile.get('trip_type', 'destination_trip'),
     }
     merged_waypoints: list[dict[str, str]] = []
     for item in [*parse_waypoints(request.waypoints_json), *extract_question_waypoints(question_text)]:

@@ -38,6 +38,7 @@ type ScenicHighlight = {
 type RouteDebug = {
   origin_point?: string | null
   destination_point?: string | null
+  best_option?: RouteOption
   weather_hint?: string
   attractions?: string[]
   hotel_candidates?: { name: string; address?: string; category?: string; location?: string }[]
@@ -57,9 +58,17 @@ type Waypoint = {
 type TripDayPlan = {
   day: number
   title: string
+  route_segment?: string
+  drive_time?: string
+  visit_time?: string
   morning: string
   afternoon: string
   evening: string
+  attractions?: { name: string; address?: string; category?: string; reason?: string; tags?: string }[]
+  meals?: string[]
+  hotel_hint?: string | null
+  recommendation_reasons?: string[]
+  tags?: string[]
   notes?: string[]
 }
 
@@ -69,6 +78,9 @@ type TravelPlanResponse = {
   scenario: string
   summary: string
   route_title: string
+  trip_type?: string
+  route_total_duration?: string
+  route_total_distance?: string
   trip_overview?: string
   duration_days?: number
   budget_estimate?: string
@@ -302,6 +314,9 @@ function PlanCard({ plan }: { plan: TravelPlanResponse }) {
         <div><span>意图</span><strong>{plan.intent}</strong></div>
         <div><span>场景</span><strong>{plan.scenario}</strong></div>
         <div><span>天数</span><strong>{plan.duration_days || '--'} 天</strong></div>
+        <div><span>出行方式</span><strong>{String(routeDebug?.request_debug?.travel_mode || '--')}</strong></div>
+        <div><span>总距离</span><strong>{plan.route_total_distance || routeDebug?.best_option?.distance || '--'}</strong></div>
+        <div><span>总耗时</span><strong>{plan.route_total_duration || routeDebug?.best_option?.duration || '--'}</strong></div>
         <div><span>天气参考</span><strong>{plan.weather_hint || '以出行前最新天气为准'}</strong></div>
       </div>
 
@@ -351,9 +366,22 @@ function PlanCard({ plan }: { plan: TravelPlanResponse }) {
               <strong>第{day.day}天</strong>
               <span>{day.title}</span>
             </div>
+            <p><b>路线段：</b>{day.route_segment || '按当日景点顺序串联'}；<b>行驶/转场：</b>{day.drive_time || '按实时路况'}；<b>可游玩：</b>{day.visit_time || '约半天至全天'}</p>
             <p><b>上午：</b>{day.morning}</p>
             <p><b>下午：</b>{day.afternoon}</p>
             <p><b>晚上：</b>{day.evening}</p>
+            {day.attractions?.length ? (
+              <div className="note-row">
+                {day.attractions.map((item) => <span key={`${day.day}-${item.name}`}>{item.name}{item.tags ? ` · ${item.tags}` : ''}</span>)}
+              </div>
+            ) : null}
+            {day.recommendation_reasons?.length ? (
+              <ul>
+                {day.recommendation_reasons.slice(0, 3).map((reason) => <li key={reason}>{reason}</li>)}
+              </ul>
+            ) : null}
+            {day.meals?.length ? <p><b>餐饮：</b>{day.meals.join(' ')}</p> : null}
+            {day.hotel_hint ? <p><b>住宿：</b>{day.hotel_hint}</p> : null}
             {day.notes?.length ? (
               <div className="note-row">
                 {day.notes.map((note) => <span key={note}>{note}</span>)}

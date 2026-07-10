@@ -17,6 +17,7 @@ from travel_agent.models.travel import (
     TravelPlanRequest,
     TravelPlanResponse,
 )
+from travel_agent.services.trip_profile_service import build_trip_profile, decide_trip_type, score_poi
 from travel_agent.tools.tencent_webservice_client import TencentWebServiceClient, TencentWebServiceError
 
 settings = get_settings()
@@ -79,6 +80,15 @@ def _extract_preferences(request: TravelPlanRequest) -> list[str]:
     if request.travel_mode == 'driving':
         prefs.append('优先驾车出行')
     return prefs or ['无显式偏好']
+
+
+def _dedupe_text(items: list[str]) -> list[str]:
+    result: list[str] = []
+    for item in items:
+        cleaned = item.strip()
+        if cleaned and cleaned not in result:
+            result.append(cleaned)
+    return result
 
 
 
@@ -513,6 +523,65 @@ def _get_route_numeric_value(text: str) -> float | None:
         return None
 
 
+def _distance_text_to_meters(text: str | None) -> int:
+    if not text:
+        return 0
+    match = re.search(r'(\d+(?:\.\d+)?)', text)
+    if not match:
+        return 0
+    value = float(match.group(1))
+    if 'km' in text or '公里' in text:
+        return int(value * 1000)
+    return int(value)
+
+
+def _duration_text_to_minutes(text: str | None) -> int:
+    return _parse_duration_minutes(text)
+
+
+def _build_route_context(request: TravelPlanRequest, best_option: RouteOption, profile: dict[str, Any], location_debug: dict[str, Any], data_source: str) -> dict[str, Any]:
+    total_minutes = _duration_text_to_minutes(best_option.duration)
+    total_meters = _distance_text_to_meters(best_option.distance)
+    days = max(1, int(profile.get('duration_days') or 1))
+    daily_drive_minutes = _estimate_drive_segments(total_minutes, days)
+    daily_context: list[dict[str, Any]] = []
+    for index, drive_minutes in enumerate(daily_drive_minutes, start=1):
+        activity_minutes = 600 if profile.get('pace') == 'intensive' else 540 if profile.get('pace') == 'normal' else 480
+        available = max(90, activity_minutes - drive_minutes)
+        if request.travel_mode == 'driving' and drive_minutes > 300:
+            recommended_spots = 1
+        elif request.travel_mode == 'driving' and drive_minutes >= 120:
+            recommended_spots = 2
+        elif request.travel_mode in {'walking', 'bicycling'} and total_meters > 80_000:
+            recommended_spots = 1
+        else:
+            recommended_spots = 3 if available >= 300 else 2
+        daily_context.append(
+            {
+                'day': index,
+                'daily_drive_minutes': drive_minutes,
+                'daily_available_visit_minutes': available,
+                'recommended_spots': recommended_spots,
+            }
+        )
+    warnings: list[str] = []
+    if request.travel_mode in {'walking', 'bicycling'} and total_meters > 80_000:
+        warnings.append('当前起终点距离较长，不适合全程步行/骑行，建议改为城市内分段体验或更换交通方式。')
+    if request.travel_mode == 'transit' and data_source != 'tencent_maps':
+        warnings.append('公共交通跨城车次需以实际购票平台为准，当前仅提供行程结构建议。')
+    return {
+        'route_total_duration_minutes': total_minutes,
+        'route_total_distance_meters': total_meters,
+        'route_total_duration': best_option.duration,
+        'route_total_distance': best_option.distance,
+        'daily_plan_context': daily_context,
+        'origin_point': location_debug.get('origin_point'),
+        'destination_point': location_debug.get('destination_point'),
+        'data_source': data_source,
+        'warnings': warnings,
+    }
+
+
 
 def _validate_route_reasonableness(best_option: RouteOption, request: TravelPlanRequest) -> list[str]:
     issues: list[str] = []
@@ -559,14 +628,19 @@ def _extract_trip_profile(request: TravelPlanRequest) -> dict[str, Any]:
             budget = '5000'
         elif '3000' in text:
             budget = '3000'
-    base_profile = request.trip_profile or {}
+    base_profile = build_trip_profile(request)
     travel_style = str(base_profile.get('travel_style') or ('轻松慢游' if any(word in text for word in ('轻松', '慢游', '休闲', '不赶')) else '常规游玩'))
     companions = str(base_profile.get('companions') or ('家庭/朋友' if any(word in text for word in ('家人', '家庭', '朋友', '亲子')) else '默认'))
     return {
         'duration_days': int(base_profile.get('duration_days') or days),
+        'nights': base_profile.get('nights') or nights,
         'budget': base_profile.get('budget') or budget,
         'travel_style': travel_style,
         'companions': companions,
+        'interest_tags': base_profile.get('interest_tags', []),
+        'avoid_tags': base_profile.get('avoid_tags', []),
+        'pace': base_profile.get('pace', 'normal'),
+        'trip_type': base_profile.get('trip_type', 'destination_trip'),
     }
 
 
@@ -661,7 +735,7 @@ def _fetch_along_route_attractions(origin_point: str | None, destination_point: 
     if not settings.tencent_maps_key or not origin_point or not destination_point:
         return []
     collected: list[str] = []
-    for keyword in _ATTRACTION_KEYWORDS:
+    for keyword in _ATTRACTION_KEYWORDS[:4]:
         try:
             payload = _client.alongby(keyword, origin_point, destination_point, radius=3000)
             collected.extend(_extract_places(payload, region_hint))
@@ -714,14 +788,14 @@ def _search_hotels_for_city(city: str, center_point: str | None = None) -> list[
     if not settings.tencent_maps_key:
         return []
     collected: list[dict[str, str]] = []
-    for keyword in _HOTEL_KEYWORDS:
+    for keyword in _HOTEL_KEYWORDS[:2]:
         try:
             payload = _client.place_search_by_region(keyword, city, page_size=5, page_index=1)
             collected.extend(_extract_poi_candidates(payload, city))
         except TencentWebServiceError:
             continue
     if center_point:
-        for keyword in ('酒店', '宾馆'):
+        for keyword in ('酒店',):
             try:
                 payload = _client.place_search_nearby_sorted(keyword, center_point, radius=2500, page_size=5, page_index=1)
                 collected.extend(_extract_poi_candidates(payload, city))
@@ -744,14 +818,14 @@ def _search_foods_for_location(city: str, center_point: str | None = None) -> li
         return []
     collected: list[dict[str, str]] = []
     if center_point:
-        for keyword in _FOOD_KEYWORDS:
+        for keyword in _FOOD_KEYWORDS[:3]:
             try:
                 payload = _client.place_search_nearby_sorted(keyword, center_point, radius=1800, page_size=6, page_index=1)
                 collected.extend(_extract_poi_candidates(payload, city))
             except TencentWebServiceError:
                 continue
     else:
-        for keyword in _FOOD_KEYWORDS:
+        for keyword in _FOOD_KEYWORDS[:3]:
             try:
                 payload = _client.place_search_by_region(keyword, city, page_size=6, page_index=1)
                 collected.extend(_extract_poi_candidates(payload, city))
@@ -826,9 +900,11 @@ def _build_summary(
     )
     food_preview = '；'.join(
         f"{item.get('name')}{f'（{item.get('address')}）' if item.get('address') else ''}"
-        for item in (food_candidates or [])[:3]
+    for item in (food_candidates or [])[:3]
         if item.get('name')
     )
+    interest_tags = request.trip_profile.get('interest_tags', []) if isinstance(request.trip_profile, dict) else []
+    avoid_tags = request.trip_profile.get('avoid_tags', []) if isinstance(request.trip_profile, dict) else []
     summary_lines = [
         f'{request.origin}到{request.destination}{profile["duration_days"]}天旅游规划',
         f'建议以{mode_labels.get(request.travel_mode, request.travel_mode)}为主，整体通行时间约{option.duration}，适合作为这次行程的交通骨架。',
@@ -836,6 +912,10 @@ def _build_summary(
         f'途经安排：{waypoint_text}。',
         f'规划侧重点：{preference_text}',
     ]
+    if interest_tags:
+        summary_lines.append(f'偏好命中：{"、".join(str(tag) for tag in interest_tags)}。')
+    if avoid_tags:
+        summary_lines.append(f'规避要求：{"、".join(str(tag) for tag in avoid_tags)}。')
     if weather_hint:
         summary_lines.append(f'天气参考：{weather_hint}')
         if any(keyword in weather_hint for keyword in ('雨', '阵雨', '雷')):
@@ -951,6 +1031,62 @@ def _select_poi_for_day(candidates: list[dict[str, str]], anchor_name: str, day_
         ranked = sorted(candidates, key=lambda item: _location_distance(anchor_location, item.get('location')) or 9999)
         return ranked[day_index % min(len(ranked), 3)]
     return candidates[day_index % len(candidates)]
+
+
+def _format_candidate_label(item: dict[str, str] | None) -> str:
+    if not item:
+        return ''
+    name = item.get('name', '').strip()
+    address = item.get('address', '').strip()
+    if not name:
+        return ''
+    return f'{name}（{address}）' if address else name
+
+
+def _pick_nearby_candidate(candidates: list[dict[str, str]], anchor_location: str | None, day_index: int) -> dict[str, str] | None:
+    if not candidates:
+        return None
+    if anchor_location:
+        ranked = sorted(candidates, key=lambda item: _location_distance(anchor_location, item.get('location')) or 9999)
+        return ranked[day_index % min(len(ranked), 3)]
+    return candidates[day_index % len(candidates)]
+
+
+def _build_meal_and_hotel_notes(
+    city: str,
+    morning_poi: dict[str, str] | None,
+    afternoon_poi: dict[str, str] | None,
+    evening_poi: dict[str, str] | None,
+    hotel_candidates: list[dict[str, str]] | None,
+    food_candidates: list[dict[str, str]] | None,
+    day_index: int,
+) -> list[str]:
+    lunch_anchor = afternoon_poi or morning_poi
+    dinner_anchor = evening_poi or afternoon_poi or morning_poi
+    hotel_anchor = evening_poi or afternoon_poi or morning_poi
+    lunch_options = food_candidates or []
+    dinner_options = food_candidates or []
+    hotel_options = hotel_candidates or []
+    lunch = _pick_nearby_candidate(lunch_options, (lunch_anchor or {}).get('location'), day_index)
+    dinner = _pick_nearby_candidate(dinner_options, (dinner_anchor or {}).get('location'), day_index + 1)
+    hotel = _pick_nearby_candidate(hotel_options, (hotel_anchor or {}).get('location'), day_index)
+    notes: list[str] = []
+    lunch_label = _format_candidate_label(lunch)
+    dinner_label = _format_candidate_label(dinner)
+    hotel_label = _format_candidate_label(hotel)
+    if lunch_label:
+        notes.append(f'午餐建议靠近{(lunch_anchor or {}).get("name") or "上午/下午景点"}：{lunch_label}。')
+    else:
+        notes.append('午餐建议选择上午景点与下午景点之间 1-2 公里范围内的本地餐厅，减少折返。')
+    if dinner_label:
+        notes.append(f'晚餐建议靠近{(dinner_anchor or {}).get("name") or "傍晚景点"}：{dinner_label}。')
+    else:
+        notes.append('晚餐建议放在傍晚景点或住宿点附近，方便结束后休息。')
+    if hotel_label:
+        notes.append(f'住宿建议靠近当天收尾景点：{hotel_label}。')
+    else:
+        notes.append('住宿建议选择当天收尾景点附近或公共交通换乘方便的商圈。')
+    return notes
 
 
 
@@ -1177,13 +1313,33 @@ def _search_hotels_for_poi(city: str, poi: dict[str, str] | None) -> list[dict[s
 
 
 
-def _build_trip_itinerary(request: TravelPlanRequest, profile: dict[str, Any], best_option: RouteOption, attractions: list[str], weather_hint: str, hotel_candidates: list[dict[str, str]] | None = None, food_candidates: list[dict[str, str]] | None = None) -> list[TripDayPlan]:
+def _build_trip_itinerary(
+    request: TravelPlanRequest,
+    profile: dict[str, Any],
+    best_option: RouteOption,
+    attractions: list[str],
+    weather_hint: str,
+    route_context: dict[str, Any],
+    hotel_candidates: list[dict[str, str]] | None = None,
+    food_candidates: list[dict[str, str]] | None = None,
+) -> list[TripDayPlan]:
     days = int(profile['duration_days'])
     destination = request.destination
     travel_style = profile['travel_style']
     preferences = request.preferences or ''
     attraction_pool = _pick_attractions(destination, attractions, preferences, max(days * 4, 8))
-    attraction_pois = _resolve_attraction_pois(destination, attraction_pool)
+    attraction_pois = _resolve_attraction_pois(destination, attraction_pool[:min(max(days * 2, 5), 7)])
+    scored_attraction_pois: list[dict[str, str]] = []
+    for index, poi in enumerate(attraction_pois):
+        enriched = dict(poi)
+        enriched['route_order'] = str(index)
+        enriched['estimated_minutes'] = str(_estimate_attraction_duration(enriched.get('name', ''), enriched.get('category'))[0])
+        score = score_poi(enriched, profile, route_context)
+        enriched['score'] = str(score['final_score'])
+        enriched['reason'] = str(score['reason'])
+        enriched['tags'] = '、'.join(str(tag) for tag in score.get('tags', [])) if isinstance(score.get('tags'), list) else ''
+        scored_attraction_pois.append(enriched)
+    attraction_pois = sorted(scored_attraction_pois or attraction_pois, key=lambda item: float(item.get('score') or 0), reverse=True)
     itinerary: list[TripDayPlan] = []
     total_drive_minutes = _parse_duration_minutes(best_option.duration)
     drive_segments = _estimate_drive_segments(total_drive_minutes, days)
@@ -1193,8 +1349,12 @@ def _build_trip_itinerary(request: TravelPlanRequest, profile: dict[str, Any], b
             pace_note = '节奏偏轻松，建议每个景点之间预留休息与机动时间。'
         else:
             pace_note = '节奏为经典游览强度，建议把核心景点放在上午与下午前段完成。'
+        day_context = next((item for item in route_context.get('daily_plan_context', []) if item.get('day') == day), {})
+        drive_today = int(day_context.get('daily_drive_minutes') or 0)
+        available_visit_minutes = int(day_context.get('daily_available_visit_minutes') or 300)
+        recommended_spots = max(1, min(3, int(day_context.get('recommended_spots') or 3)))
         available_pool = [item for item in attraction_pool if item not in used_attractions]
-        day_pool = available_pool[:3]
+        day_pool = available_pool[:recommended_spots]
         if len(day_pool) < 3:
             fallback_pool = [item for item in attraction_pool if item not in day_pool and item in used_attractions]
             day_pool = (day_pool + fallback_pool)[:3]
@@ -1214,7 +1374,8 @@ def _build_trip_itinerary(request: TravelPlanRequest, profile: dict[str, Any], b
             used_names.add(afternoon_poi.get('name'))
         evening_candidates = [item for item in base_candidates if item.get('name') not in used_names]
         evening_poi = _select_poi_for_day(evening_candidates or base_candidates, evening_spot, day + 1, afternoon_poi.get('location') if afternoon_poi else (morning_poi.get('location') if morning_poi else None))
-        drive_today = drive_segments[min(day - 1, len(drive_segments) - 1)] if drive_segments else 0
+        if not drive_today:
+            drive_today = drive_segments[min(day - 1, len(drive_segments) - 1)] if drive_segments else 0
         morning_name = (morning_poi or {}).get('name') or morning_spot
         afternoon_name = (afternoon_poi or {}).get('name') or afternoon_spot
         evening_name = (evening_poi or {}).get('name') or evening_spot
@@ -1230,6 +1391,12 @@ def _build_trip_itinerary(request: TravelPlanRequest, profile: dict[str, Any], b
         transfer_2 = 20 if move_2 is not None and move_2 < 0.03 else 35
         move_1_text = '两点距离较近，建议步行或短途接驳。' if transfer_1 == 20 else '两点之间建议预留 30-40 分钟交通切换。'
         move_2_text = '傍晚景点与下午景点衔接紧凑，可减少折返。' if transfer_2 == 20 else '晚间景点建议根据体力决定是否保留。'
+        meal_hotel_notes = _build_meal_and_hotel_notes(destination, morning_poi, afternoon_poi, evening_poi, hotel_candidates, food_candidates, day - 1)
+        day_attractions = [item for item in (morning_poi, afternoon_poi, evening_poi) if item]
+        day_reasons = [str(item.get('reason')) for item in day_attractions if item.get('reason')]
+        day_tags = _dedupe_text([tag for item in day_attractions for tag in str(item.get('tags') or '').split('、') if tag])
+        meal_notes = [note for note in meal_hotel_notes if note.startswith(('午餐', '晚餐'))]
+        hotel_note = next((note for note in meal_hotel_notes if note.startswith('住宿')), None)
         title = f'第{day}天：{destination}景点游览规划'
 
         if request.travel_mode == 'driving' and drive_today >= 180 and day < days:
@@ -1281,12 +1448,40 @@ def _build_trip_itinerary(request: TravelPlanRequest, profile: dict[str, Any], b
             f'天气参考：{weather_hint}',
             f'天气策略：{"优先室内景点，室外项目压缩到早晚" if any(keyword in weather_hint for keyword in ("雨", "阵雨", "雷")) else "中午避开户外暴晒，室外景点尽量安排在上午或傍晚" if any(keyword in weather_hint for keyword in ("高温", "暴晒")) else "天气相对平稳，可按常规经典顺序游览"}。',
             f'当日景点建议停留总时长约 {_format_duration_minutes(morning_duration + afternoon_duration + min(evening_duration, 120))}。',
+            f'景点转场参考：上午到下午约预留 {transfer_1} 分钟，下午到傍晚约预留 {transfer_2} 分钟。',
             f'交通骨架参考：整体通行约{best_option.duration}，距离约{best_option.distance}。',
+            *meal_hotel_notes,
         ]
         for used_name in (morning_name, afternoon_name, evening_name):
             if used_name:
                 used_attractions.add(used_name)
-        itinerary.append(TripDayPlan(day=day, title=title, morning=morning, afternoon=afternoon, evening=evening, notes=notes))
+        itinerary.append(
+            TripDayPlan(
+                day=day,
+                title=title,
+                route_segment=f'{request.origin} → {destination}' if day == 1 else f'{destination}第{day}天市内/沿途段',
+                drive_time=_format_duration_minutes(drive_today),
+                visit_time=_format_duration_minutes(available_visit_minutes),
+                morning=morning,
+                afternoon=afternoon if recommended_spots >= 2 else '保留为抵达、入住或休息时间，不强行增加景点。',
+                evening=evening if recommended_spots >= 3 else '晚间以就近用餐和休息为主，避免路途疲劳。',
+                attractions=[
+                    {
+                        'name': item.get('name', ''),
+                        'address': item.get('address', ''),
+                        'category': item.get('category', ''),
+                        'reason': item.get('reason', ''),
+                        'tags': item.get('tags', ''),
+                    }
+                    for item in day_attractions[:recommended_spots]
+                ],
+                meals=meal_notes,
+                hotel_hint=hotel_note,
+                recommendation_reasons=day_reasons[:recommended_spots],
+                tags=day_tags[:5],
+                notes=notes,
+            )
+        )
     return itinerary
 
 
@@ -1310,12 +1505,13 @@ def _build_trip_content(
             f'{destination}历史文化街区',
             f'{destination}城市公园',
         ]
-    accommodation_suggestion = '住宿不作为本次行程主线，仅建议住在核心景点与交通换乘都较方便的区域。'
+    accommodation_suggestion = '住宿按每日收尾景点就近选择，优先住在核心景点、老城区商圈或交通换乘方便区域，减少第二天折返。'
     transportation_suggestion = _build_transportation_suggestions(request, best_option)
     transportation_suggestion = transportation_suggestion[:3]
     travel_tips = [
         f'{duration_days}天行程按“抵达适应—经典景点深度游—返程收尾”拆分，避免每天排满。',
         '行程重点围绕经典景点的停留时长、景点间距离和天气适配来组织。',
+        '餐厅优先放在上午/下午景点之间，酒店优先贴近当天最后一个景点或换乘方便商圈。',
         '热门博物馆、古迹、演出和景区门票建议提前预约；每天至少保留30-60分钟机动时间。',
         f'天气提示：{weather_hint}',
     ]
@@ -1345,7 +1541,10 @@ def build_travel_plan(request: TravelPlanRequest) -> TravelPlanResponse:
     profile = _extract_trip_profile(request)
     route_options, data_source, route_error, location_debug = _fetch_tencent_route_options(request, scenario)
     best_option = _choose_best_option(route_options, request)
+    route_context = _build_route_context(request, best_option, profile, location_debug, data_source)
+    profile['trip_type'] = decide_trip_type({**profile, 'origin': request.origin, 'destination': request.destination, 'travel_mode': request.travel_mode, 'source_text': request.source_query or request.preferences or ''}, route_context)
     route_issues = _validate_route_reasonableness(best_option, request)
+    route_issues.extend(str(item) for item in route_context.get('warnings', []))
     destination_point = location_debug.get('destination_point')
     origin_point = location_debug.get('origin_point')
     weather_hint = _fetch_weather_hint(request.destination, destination_point)
@@ -1373,7 +1572,7 @@ def build_travel_plan(request: TravelPlanRequest) -> TravelPlanResponse:
         hotel_candidates,
         food_candidates,
     )
-    daily_itinerary = _build_trip_itinerary(request, profile, best_option, attraction_recommendations, weather_hint, hotel_candidates, food_candidates)
+    daily_itinerary = _build_trip_itinerary(request, profile, best_option, attraction_recommendations, weather_hint, route_context, hotel_candidates, food_candidates)
     short_term = memory_context.get('short_term', []) if isinstance(memory_context, dict) else []
     history = [
         ConversationTurn(user_input=str(item.get('user_input') or ''), assistant_output=str(item.get('assistant_output') or ''))
@@ -1390,6 +1589,9 @@ def build_travel_plan(request: TravelPlanRequest) -> TravelPlanResponse:
         scenario=scenario,
         summary=summary,
         route_title=f'{request.origin} → {request.destination} 旅游规划方案',
+        trip_type=str(profile.get('trip_type') or 'destination_trip'),
+        route_total_duration=str(route_context.get('route_total_duration') or best_option.duration),
+        route_total_distance=str(route_context.get('route_total_distance') or best_option.distance),
         trip_overview=trip_overview,
         duration_days=int(profile['duration_days']),
         budget_estimate=budget_summary,
@@ -1420,9 +1622,14 @@ def build_travel_plan(request: TravelPlanRequest) -> TravelPlanResponse:
                 'waypoint_order': request.waypoint_order,
                 'request_source': request.request_source,
                 'source_query': request.source_query,
+                'trip_type': profile.get('trip_type'),
+                'interest_tags': profile.get('interest_tags', []),
+                'avoid_tags': profile.get('avoid_tags', []),
+                'pace': profile.get('pace'),
             },
             'location_debug': location_debug,
             'trip_profile': profile,
+            'route_context': route_context,
             'weather_hint': weather_hint,
             'attractions': attraction_recommendations,
             'hotel_candidates': hotel_candidates,

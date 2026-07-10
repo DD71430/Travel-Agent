@@ -1,4 +1,4 @@
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -17,7 +17,7 @@ class TravelPlanRequest(BaseModel):
     waypoints: list[Waypoint] = Field(default_factory=list, description='途经点列表')
     waypoint_order: bool = Field(default=False, description='是否让服务端智能排序途经点')
     request_source: Literal['sidebar', 'chat'] = 'sidebar'
-    trip_profile: dict[str, str | int | None] = Field(default_factory=dict, description='结构化旅行需求')
+    trip_profile: dict[str, Any] = Field(default_factory=dict, description='结构化旅行需求')
 
 
 class UnifiedResponseData(BaseModel):
@@ -63,9 +63,17 @@ class RouteOption(BaseModel):
 class TripDayPlan(BaseModel):
     day: int
     title: str
+    route_segment: str | None = None
+    drive_time: str | None = None
+    visit_time: str | None = None
     morning: str
     afternoon: str
     evening: str
+    attractions: list[dict[str, str]] = Field(default_factory=list)
+    meals: list[str] = Field(default_factory=list)
+    hotel_hint: str | None = None
+    recommendation_reasons: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
 
 
@@ -80,6 +88,9 @@ class TravelPlanResponse(BaseModel):
     scenario: str
     summary: str
     route_title: str
+    trip_type: str = 'destination_trip'
+    route_total_duration: str = ''
+    route_total_distance: str = ''
     trip_overview: str = ''
     duration_days: int = 3
     budget_estimate: str = '待估算'
