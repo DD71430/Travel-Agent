@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
+from uuid import uuid4
 
 from fastapi import APIRouter, File, Form, UploadFile
 
@@ -19,6 +20,10 @@ memory_store = RedisMemoryStore()
 logger = get_logger(__name__)
 
 
+def _new_conversation_id() -> str:
+    return str(uuid4())
+
+
 def _friendly_error_response(request: ChatRequest, message: str, code: str) -> dict[str, Any]:
     response = build_general_response(request)
     response['final_answer'] = message
@@ -27,13 +32,15 @@ def _friendly_error_response(request: ChatRequest, message: str, code: str) -> d
 
 
 def _ensure_response_fields(response: dict[str, Any], request: ChatRequest, upload_context: dict | None = None) -> dict[str, Any]:
-    response.setdefault('conversation_id', request.conversation_id or 'default')
+    response.setdefault('conversation_id', request.conversation_id or _new_conversation_id())
     response.setdefault('answer_type', 'general_chat')
     response.setdefault('final_answer', '')
     response.setdefault('data', {})
     response.setdefault('travel_request', None)
     response.setdefault('upload_context', upload_context)
-    response.setdefault('meta', {})
+    if not isinstance(response.get('meta'), dict):
+        response['meta'] = {}
+    response['meta']['memory'] = memory_store.status()
     response.setdefault('error', None)
     if upload_context and response.get('upload_context') is None:
         response['upload_context'] = upload_context
@@ -66,11 +73,11 @@ def _remember(conversation_id: str, user_question: str, response: dict[str, Any]
 
 @router.post('')
 async def chat(request: ChatRequest) -> dict[str, Any]:
-    conversation_id = request.conversation_id or 'default'
+    conversation_id = request.conversation_id or _new_conversation_id()
     request = ChatRequest(**{**request.model_dump(), 'conversation_id': conversation_id})
     memory_store.get_context(conversation_id)
     intent = classify_chat_intent(request.question)
-    response = await _run_graph(request)
+    response = _ensure_response_fields(await _run_graph(request), request)
     _remember(conversation_id, request.question, response, intent, None)
     return response
 
@@ -93,7 +100,7 @@ async def multimodal_chat(
     waypoint_order: str | None = Form(None),
     waypoints_json: str | None = Form(None),
 ) -> dict[str, Any]:
-    conversation_id = conversation_id or 'default'
+    conversation_id = conversation_id or _new_conversation_id()
     memory_store.get_context(conversation_id)
     upload_context = None
     merged_question = question
@@ -132,7 +139,7 @@ async def multimodal_chat(
             merged_question = merge_question_with_file_context(question, upload_context)
     request_payload = ChatRequest(question=merged_question, **base_payload)
     intent = classify_chat_intent(merged_question)
-    response = await _run_graph(request_payload, upload_context)
+    response = _ensure_response_fields(await _run_graph(request_payload, upload_context), request_payload, upload_context)
     if upload_context and not str(response.get('final_answer') or '').strip():
         if upload_context.get('file_kind') == 'image':
             response['final_answer'] = f'已接收图片 {upload_context["filename"]}；当前版本暂未解析图片内容，可补充文字需求。'

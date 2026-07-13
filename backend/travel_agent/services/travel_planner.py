@@ -27,7 +27,14 @@ from travel_agent.services.poi_candidate_service import (
 )
 from travel_agent.services.route_stop_service import infer_route_stops
 from travel_agent.services.trip_profile_service import build_trip_profile, decide_trip_type, score_poi
-from travel_agent.services.weather_service import build_weather_context, build_weather_tips
+from travel_agent.services.weather_service import (
+    build_daily_weather_adjustments,
+    build_daily_weather_brief,
+    build_weather_context,
+    build_weather_plan_summary,
+    build_weather_tips,
+    weather_badge_for_day,
+)
 from travel_agent.tools.tencent_webservice_client import TencentWebServiceClient, TencentWebServiceError
 
 settings = get_settings()
@@ -116,6 +123,49 @@ def _extract_preferences(request: TravelPlanRequest) -> list[str]:
     if request.travel_mode == 'driving':
         prefs.append('优先驾车出行')
     return prefs or ['无显式偏好']
+
+
+def _extract_weather_sensitivity(request: TravelPlanRequest, profile: dict[str, Any]) -> list[str]:
+    source = f"{request.preferences or ''} {request.source_query or ''} {profile.get('companions') or ''}"
+    sensitivity: list[str] = []
+    if any(keyword in source for keyword in ('怕热', '高温', '晒', '中暑')):
+        sensitivity.append('怕热')
+    if any(keyword in source for keyword in ('雨天不走户外', '下雨不户外', '雨天少户外', '怕下雨')):
+        sensitivity.append('雨天不走户外')
+    if any(keyword in source for keyword in ('老人', '长辈')):
+        sensitivity.append('带老人')
+    if any(keyword in source for keyword in ('亲子', '孩子', '小朋友')):
+        sensitivity.append('亲子')
+    return _dedupe_text(sensitivity)
+
+
+def _memory_profile_patch(request: TravelPlanRequest, profile: dict[str, Any], preferences: list[str]) -> dict[str, Any]:
+    return {
+        'travel_preferences': preferences,
+        'last_origin': request.origin,
+        'last_destination': request.destination,
+        'last_trip_type': profile.get('trip_type') or 'destination_trip',
+        'preferred_pace': profile.get('pace') or 'normal',
+        'interest_tags': profile.get('interest_tags', []),
+        'avoid_tags': profile.get('avoid_tags', []),
+        'weather_sensitivity': _extract_weather_sensitivity(request, profile),
+    }
+
+
+def _load_and_update_memory(active_memory_store: RedisMemoryStore, conversation_id: str, request: TravelPlanRequest, profile: dict[str, Any], preferences: list[str]) -> tuple[list[str], list[dict[str, Any]]]:
+    memory_context = active_memory_store.get_context(conversation_id)
+    long_term = memory_context.get('long_term', {}) if isinstance(memory_context, dict) else {}
+    stored_preferences = long_term.get('travel_preferences', []) if isinstance(long_term, dict) else []
+    if not isinstance(stored_preferences, list):
+        stored_preferences = []
+    user_preferences = list(stored_preferences)
+    for pref in preferences:
+        if pref not in user_preferences:
+            user_preferences.append(pref)
+    active_memory_store.update_profile(conversation_id, _memory_profile_patch(request, profile, user_preferences))
+    short_term = memory_context.get('short_term', []) if isinstance(memory_context, dict) else []
+    short_term = [item for item in short_term if isinstance(item, dict)]
+    return user_preferences, short_term
 
 
 def _dedupe_text(items: list[str]) -> list[str]:
@@ -522,6 +572,12 @@ def _fetch_tencent_route_options(request: TravelPlanRequest, scenario: str) -> t
                 raise TencentMapsError(f'Unable to resolve waypoint: {waypoint} via {waypoint_source}')
             waypoint_coords.append(waypoint_point)
             location_debug[f'waypoint:{waypoint}'] = waypoint_source
+            try:
+                waypoint_adcode = _extract_reverse_adcode(_client.reverse_geocoder(waypoint_point))
+                if waypoint_adcode:
+                    location_debug[f'waypoint_adcode:{waypoint}'] = waypoint_adcode
+            except Exception:
+                location_debug[f'waypoint_adcode_error:{waypoint}'] = 'reverse_geocoder_failed'
     except TencentMapsError as exc:
         location_debug['reason'] = 'geocode_failed'
         return _fallback_routes(request, scenario, 'geocode_failed'), 'fallback', f'Geocode failed: {exc}', location_debug
@@ -1593,7 +1649,10 @@ def _build_lodging_suggestion(stop_city: str, destination: str, is_last_day: boo
 
 
 def _effective_weather_day(weather_context: dict[str, Any], weather_day: dict[str, Any] | None) -> dict[str, Any] | None:
-    if weather_context.get('data_source') != 'tencent_maps':
+    if not weather_day:
+        return None
+    day_source = str(weather_day.get('data_source') or weather_context.get('data_source') or '')
+    if day_source != 'tencent_maps':
         return None
     return weather_day
 
@@ -1929,6 +1988,12 @@ def _build_trip_itinerary(
         if stage == 'buffer':
             recommended_spots = min(recommended_spots, 1)
         effective_weather = _effective_weather_day(weather_context, weather_day)
+        weather_badge = weather_badge_for_day(weather_context, weather_day)
+        raw_weather_tags = [str(item) for item in (weather_day or {}).get('weather_tags', [])] if isinstance((weather_day or {}).get('weather_tags'), list) else []
+        is_rain_weather = weather_badge in {'雨天', '预警'} or 'rain' in raw_weather_tags
+        is_heat_weather = weather_badge == '高温' or 'heat' in raw_weather_tags or 'sun_exposure' in raw_weather_tags
+        weather_summary = build_daily_weather_brief(weather_context, weather_day)
+        daily_weather_adjustments = build_daily_weather_adjustments(weather_context, weather_day)
         day_candidate_pois = _candidate_pois_for_day(
             anchor_city=anchor_city,
             stage=stage,
@@ -2079,26 +2144,40 @@ def _build_trip_itinerary(
             morning = morning.replace('上午主攻', f'目的地第{stage_day}天上午主攻')
             afternoon = afternoon.replace('下午转场至', '下午在目的地内转场至')
             evening = evening.replace('傍晚安排', '晚间就近安排')
-            if effective_weather and effective_weather.get('indoor_priority'):
+            if effective_weather and is_rain_weather:
                 morning = morning.replace('目的地第', '雨天优先室内：目的地第')
                 afternoon = afternoon.replace('下午在目的地内转场至', '下午优先转场至室内或遮蔽条件较好的')
+            elif effective_weather and is_heat_weather:
+                morning = morning.replace('目的地第', '晴热早段优先户外：目的地第')
+                afternoon = f'中午安排室内景点、午餐或休整，避开正午户外暴晒；{afternoon}'
             elif effective_weather and effective_weather.get('outdoor_suitability') == 'good':
                 morning = morning.replace('目的地第', '天气适合室外：目的地第')
         elif stage == 'buffer':
             morning = f'09:30-11:30 保留机动时间，可补充 {morning_name} 或处理返程/换乘安排。' if morning_poi else '09:30-11:30 保留机动时间，处理返程、换乘或补漏预约事项。'
             afternoon = '下午根据天气、体力和返程时间自由调整，不再强行增加远距离景点。'
             evening = '晚间以就近用餐、整理行李和休息为主。'
-        if weather_context.get('data_source') == 'fallback':
+        if effective_weather and is_rain_weather:
+            if '带伞/雨衣' not in morning:
+                morning = f'雨天带伞/雨衣并注意防滑，优先室内或遮蔽点位；{morning}'
+            if '湖边、公园、步道压缩游览' not in afternoon:
+                afternoon = f'下午优先室内或遮蔽点位，湖边、公园、步道压缩游览；{afternoon}'
+        elif effective_weather and is_heat_weather:
+            if '避开正午户外暴晒' not in afternoon:
+                afternoon = f'中午安排室内景点、午餐或休整，避开正午户外暴晒；{afternoon}'
+            if '补水' not in evening:
+                evening = f'傍晚再补充户外点位并注意补水；{evening}'
+        weather_data_source = str((weather_day or {}).get('data_source') or weather_context.get('data_source') or 'fallback')
+        if weather_data_source != 'tencent_maps':
             weather_strategy = '天气待确认，建议出行前查看实时天气；本行程保留室内/室外备选。'
         else:
             weather_strategy = str((weather_day or {}).get('strategy') or '按实时天气调整室内外景点顺序。')
         weather_label = ''
         if weather_day:
-            if weather_context.get('data_source') == 'fallback':
+            if weather_data_source != 'tencent_maps':
                 weather_label = f'当天天气：{anchor_city} 天气待确认。'
             else:
                 weather_label = f"当天天气：{weather_day.get('city', anchor_city)} {weather_day.get('weather', '天气待确认')}，{weather_day.get('temperature', '温度待确认')}。"
-        generated_weather_tips = build_weather_tips(weather_day, data_source=str(weather_context.get('data_source') or 'fallback')) if weather_day else {}
+        generated_weather_tips = build_weather_tips(weather_day, data_source=weather_data_source) if weather_day else {}
 
         def structured_weather_list(key: str) -> list[str]:
             explicit = (weather_day or {}).get(key, [])
@@ -2126,6 +2205,7 @@ def _build_trip_itinerary(
             pace_note,
             weather_label,
             f'天气策略：{weather_strategy}',
+            *daily_weather_adjustments,
             visit_note,
             transfer_note,
             f'当日路线段：{route_segment}，{"预计" if segment_data_source != "tencent_maps" else "腾讯地图"}行驶/转场约{_format_duration_minutes(drive_today)}。',
@@ -2151,6 +2231,9 @@ def _build_trip_itinerary(
                 drive_time=_format_duration_minutes(drive_today),
                 visit_time=_format_duration_minutes(available_visit_minutes),
                 weather_strategy=weather_strategy,
+                weather_summary=weather_summary,
+                weather_adjustments=daily_weather_adjustments,
+                weather_badge=weather_badge,
                 weather_tips=weather_tips,
                 packing_tips=packing_tips,
                 weather_tags=weather_tags,
@@ -2228,21 +2311,14 @@ def compose_travel_plan(
     weather_context: dict[str, Any],
     ranked_pois: dict[str, list[dict[str, Any]]],
     daily_itinerary: list[TripDayPlan] | None = None,
+    memory_store_override: RedisMemoryStore | None = None,
 ) -> TravelPlanResponse:
     conversation_id = request.conversation_id or str(uuid4())
     intent = _classify_intent(f"{request.origin} {request.destination} {request.preferences or ''} {request.source_query or ''}")
     scenario = _classify_scenario(request)
     preferences = _extract_preferences(request)
-    memory_context = memory_store.get_context(conversation_id)
-    long_term = memory_context.get('long_term', {}) if isinstance(memory_context, dict) else {}
-    stored_preferences = long_term.get('travel_preferences', [])
-    if not isinstance(stored_preferences, list):
-        stored_preferences = []
-    user_preferences = list(stored_preferences)
-    for pref in preferences:
-        if pref not in user_preferences:
-            user_preferences.append(pref)
-    memory_store.update_profile(conversation_id, {'travel_preferences': user_preferences})
+    active_memory_store = memory_store_override or memory_store
+    user_preferences, short_term = _load_and_update_memory(active_memory_store, conversation_id, request, profile, preferences)
     if not route_options:
         route_options = _fallback_routes(request, scenario, 'empty_state')
         data_source = 'fallback'
@@ -2281,12 +2357,15 @@ def compose_travel_plan(
     )
     if daily_itinerary is None:
         daily_itinerary = build_daily_itinerary(request, profile, route_context, ranked_pois, route_options, weather_hint, hotel_candidates, food_candidates)
+    weather_plan_summary = build_weather_plan_summary(weather_context, daily_itinerary)
+    if weather_plan_summary.get('weather_overview'):
+        summary = f'{summary}\n天气融入：{weather_plan_summary["weather_overview"]}'
+        trip_overview = f'{trip_overview} 天气融入：{weather_plan_summary["weather_overview"]}'
     scheduled_names = {str(item.get('name')) for day in daily_itinerary for item in day.attractions if item.get('name')}
     must_visit_attractions = [str(item) for item in profile.get('must_visit_attractions') or [] if str(item).strip()]
     unscheduled_waypoints = [name for name in must_visit_attractions if name not in scheduled_names]
     if unscheduled_waypoints:
         travel_tips.append(f'以下用户指定地点未能放入每日主行程，建议作为备选或延长停留：{"、".join(unscheduled_waypoints)}。')
-    short_term = memory_context.get('short_term', []) if isinstance(memory_context, dict) else []
     history = [
         ConversationTurn(user_input=str(item.get('user_input') or ''), assistant_output=str(item.get('assistant_output') or ''))
         for item in short_term[-10:]
@@ -2311,6 +2390,9 @@ def compose_travel_plan(
         accommodation_suggestion=accommodation_suggestion,
         transportation_suggestion=transportation_suggestion,
         weather_hint=weather_hint,
+        weather_overview=str(weather_plan_summary.get('weather_overview') or ''),
+        weather_adjustments=[str(item) for item in weather_plan_summary.get('weather_adjustments', [])],
+        packing_summary=[str(item) for item in weather_plan_summary.get('packing_summary', [])],
         attraction_recommendations=attraction_recommendations,
         hotel_candidates=hotel_candidates,
         food_candidates=food_candidates,
@@ -2357,6 +2439,7 @@ def compose_travel_plan(
             'trip_profile': profile,
             'route_context': route_context,
             'weather_context': weather_context,
+            'weather_plan_summary': weather_plan_summary,
             'weather_hint': weather_hint,
             'attractions': attraction_recommendations,
             'hotel_candidates': hotel_candidates,
@@ -2368,21 +2451,12 @@ def compose_travel_plan(
     )
 
 
-def build_travel_plan(request: TravelPlanRequest) -> TravelPlanResponse:
+def build_travel_plan(request: TravelPlanRequest, memory_store_override: RedisMemoryStore | None = None) -> TravelPlanResponse:
     conversation_id = request.conversation_id or str(uuid4())
     intent = _classify_intent(f"{request.origin} {request.destination} {request.preferences or ''} {request.source_query or ''}")
     scenario = _classify_scenario(request)
     preferences = _extract_preferences(request)
-    memory_context = memory_store.get_context(conversation_id)
-    long_term = memory_context.get('long_term', {}) if isinstance(memory_context, dict) else {}
-    stored_preferences = long_term.get('travel_preferences', [])
-    if not isinstance(stored_preferences, list):
-        stored_preferences = []
-    user_preferences = list(stored_preferences)
-    for pref in preferences:
-        if pref not in user_preferences:
-            user_preferences.append(pref)
-    memory_store.update_profile(conversation_id, {'travel_preferences': user_preferences})
+    active_memory_store = memory_store_override or memory_store
     profile = _extract_trip_profile(request)
     route_options, data_source, route_error, location_debug = fetch_route_options(request, profile)
     best_option = _choose_best_option(route_options, request)
@@ -2396,6 +2470,7 @@ def build_travel_plan(request: TravelPlanRequest) -> TravelPlanResponse:
         profile['stage_plan_mode'] = stage_counts.get('stage_plan_mode') or profile.get('stage_plan_mode')
         profile['stage_notes'] = stage_counts.get('stage_notes', [])
     profile['trip_type'] = decide_trip_type({**profile, 'origin': request.origin, 'destination': request.destination, 'travel_mode': request.travel_mode, 'source_text': request.source_query or request.preferences or ''}, route_context)
+    user_preferences, short_term = _load_and_update_memory(active_memory_store, conversation_id, request, profile, preferences)
     route_issues = _validate_route_reasonableness(best_option, request)
     route_issues.extend(str(item) for item in route_context.get('warnings', []))
     destination_point = location_debug.get('destination_point')
@@ -2444,12 +2519,15 @@ def build_travel_plan(request: TravelPlanRequest) -> TravelPlanResponse:
         food_candidates,
     )
     daily_itinerary = _build_trip_itinerary(request, profile, best_option, attraction_recommendations, weather_hint, route_context, hotel_candidates, food_candidates, ranked_pois)
+    weather_plan_summary = build_weather_plan_summary(weather_context, daily_itinerary)
+    if weather_plan_summary.get('weather_overview'):
+        summary = f'{summary}\n天气融入：{weather_plan_summary["weather_overview"]}'
+        trip_overview = f'{trip_overview} 天气融入：{weather_plan_summary["weather_overview"]}'
     scheduled_names = {str(item.get('name')) for day in daily_itinerary for item in day.attractions if item.get('name')}
     must_visit_attractions = [str(item) for item in profile.get('must_visit_attractions') or [] if str(item).strip()]
     unscheduled_waypoints = [name for name in must_visit_attractions if name not in scheduled_names]
     if unscheduled_waypoints:
         travel_tips.append(f'以下用户指定地点未能放入每日主行程，建议作为备选或延长停留：{"、".join(unscheduled_waypoints)}。')
-    short_term = memory_context.get('short_term', []) if isinstance(memory_context, dict) else []
     history = [
         ConversationTurn(user_input=str(item.get('user_input') or ''), assistant_output=str(item.get('assistant_output') or ''))
         for item in short_term[-10:]
@@ -2474,6 +2552,9 @@ def build_travel_plan(request: TravelPlanRequest) -> TravelPlanResponse:
         accommodation_suggestion=accommodation_suggestion,
         transportation_suggestion=transportation_suggestion,
         weather_hint=weather_hint,
+        weather_overview=str(weather_plan_summary.get('weather_overview') or ''),
+        weather_adjustments=[str(item) for item in weather_plan_summary.get('weather_adjustments', [])],
+        packing_summary=[str(item) for item in weather_plan_summary.get('packing_summary', [])],
         attraction_recommendations=attraction_recommendations,
         hotel_candidates=hotel_candidates,
         food_candidates=food_candidates,
@@ -2520,6 +2601,7 @@ def build_travel_plan(request: TravelPlanRequest) -> TravelPlanResponse:
             'trip_profile': profile,
             'route_context': route_context,
             'weather_context': weather_context,
+            'weather_plan_summary': weather_plan_summary,
             'weather_hint': weather_hint,
             'attractions': attraction_recommendations,
             'hotel_candidates': hotel_candidates,

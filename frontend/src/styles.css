@@ -4,22 +4,24 @@
 
 :root {
   color-scheme: light;
-  --bg: #f3f7ff;
-  --panel: rgba(255, 255, 255, 0.9);
+  --bg: #f5f7f4;
+  --panel: rgba(255, 255, 255, 0.94);
   --panel-strong: #ffffff;
-  --line: #dce6f5;
-  --text: #10223a;
-  --muted: #6d7f96;
-  --primary: #2563eb;
-  --primary-strong: #1d4ed8;
-  --accent: #7c3aed;
+  --line: #d9e2dc;
+  --text: #17231f;
+  --muted: #66746d;
+  --primary: #0f766e;
+  --primary-strong: #115e59;
+  --accent: #b45309;
   --danger: #b42318;
+  --rain: #2563eb;
+  --heat: #c2410c;
 }
 
 body {
   margin: 0;
   font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  background: radial-gradient(circle at top, #e8f0ff 0, #f8fbff 40%, #ffffff 100%);
+  background: linear-gradient(180deg, #f1f5f2 0%, #fbfcfa 42%, #ffffff 100%);
   color: var(--text);
 }
 
@@ -40,7 +42,7 @@ textarea,
 select {
   width: 100%;
   border: 1px solid var(--line);
-  border-radius: 14px;
+  border-radius: 8px;
   padding: 12px 14px;
   background: #fff;
   color: var(--text);
@@ -51,7 +53,7 @@ input:focus,
 textarea:focus,
 select:focus {
   border-color: #99b6ff;
-  box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.08);
+  box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.09);
 }
 
 .app-shell {
@@ -98,27 +100,27 @@ select:focus {
 .status-pill,
 .status-badge {
   padding: 10px 14px;
-  border-radius: 999px;
-  background: #e8f0ff;
-  color: #2457d6;
+  border-radius: 8px;
+  background: #e7f4ef;
+  color: var(--primary-strong);
   font-weight: 600;
 }
 
 .ghost-button,
 .primary-button,
 .chip {
-  border-radius: 14px;
+  border-radius: 8px;
   padding: 12px 16px;
   font-weight: 600;
 }
 
 .ghost-button {
-  background: #eef4ff;
-  color: #2457d6;
+  background: #edf4f0;
+  color: var(--primary-strong);
 }
 
 .primary-button {
-  background: linear-gradient(135deg, var(--primary), var(--accent));
+  background: var(--primary);
   color: white;
 }
 
@@ -132,13 +134,13 @@ select:focus {
 }
 
 .chip {
-  background: #f0f4ff;
-  color: #29498a;
+  background: #f5f0e8;
+  color: #7c3f12;
 }
 
 .small {
   padding: 8px 12px;
-  border-radius: 12px;
+  border-radius: 8px;
 }
 
 .workspace {
@@ -157,11 +159,11 @@ select:focus {
 
 .card {
   background: var(--panel);
-  backdrop-filter: blur(18px);
-  border: 1px solid rgba(255, 255, 255, 0.8);
-  border-radius: 24px;
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--line);
+  border-radius: 8px;
   padding: 20px;
-  box-shadow: 0 18px 50px rgba(20, 50, 110, 0.08);
+  box-shadow: 0 12px 34px rgba(40, 54, 47, 0.07);
 }
 
 .card + .card {
@@ -236,7 +238,7 @@ select:focus {
   text-align: left;
   background: #f8fbff;
   border: 1px solid var(--line);
-  border-radius: 18px;
+  border-radius: 8px;
   padding: 14px;
   display: grid;
   gap: 6px;
@@ -267,8 +269,8 @@ select:focus {
 
 .empty-chat {
   border: 1px dashed #bfd0f0;
-  background: #f8fbff;
-  border-radius: 24px;
+  background: #f7faf7;
+  border-radius: 8px;
   padding: 28px;
   text-align: center;
 }
@@ -277,14 +279,14 @@ select:focus {
   display: grid;
   gap: 8px;
   padding: 16px 18px;
-  border-radius: 18px;
+  border-radius: 8px;
   max-width: 100%;
 }
 
 .message.user {
   justify-self: end;
-  background: linear-gradient(135deg, #e8f0ff, #f3ebff);
-  border: 1px solid #dce6f5;
+  background: #e8f4ef;
+  border: 1px solid #cfe3d8;
 }
 
 .message.assistant {
@@ -327,38 +329,85 @@ select:focus {
 }
 
 .plan-meta-grid,
-.route-meta-grid {
+.route-meta-grid,
+.overview-strip,
+.debug-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
 }
 
 .plan-meta-grid div,
-.route-meta-grid div {
-  background: #f8fbff;
+.route-meta-grid div,
+.overview-strip div,
+.debug-grid div {
+  background: #f7faf7;
   border: 1px solid var(--line);
-  border-radius: 18px;
+  border-radius: 8px;
   padding: 12px;
   display: grid;
   gap: 4px;
 }
 
 .plan-meta-grid span,
-.route-meta-grid span {
+.route-meta-grid span,
+.overview-strip span,
+.debug-grid span {
   color: var(--muted);
   font-size: 12px;
 }
 
 .plan-meta-grid strong,
-.route-meta-grid strong {
+.route-meta-grid strong,
+.overview-strip strong,
+.debug-grid strong {
   word-break: break-word;
+}
+
+.overview-strip {
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+}
+
+.overview-strip strong {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.result-tabs {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 8px;
+}
+
+.result-tabs button {
+  min-height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: #46564f;
+  font-weight: 700;
+}
+
+.result-tabs button.active {
+  background: #e7f4ef;
+  border-color: #9bc9bd;
+  color: var(--primary-strong);
+}
+
+.tab-panel {
+  display: grid;
+  gap: 12px;
 }
 
 .fallback-banner {
   background: #fff7ed;
   border: 1px solid #fed7aa;
   color: #9a3412;
-  border-radius: 12px;
+  border-radius: 8px;
   font-size: 13px;
   font-weight: 700;
   padding: 10px 12px;
@@ -368,16 +417,16 @@ select:focus {
   background: #eff6ff;
   border: 1px solid #bfdbfe;
   color: #1d4ed8;
-  border-radius: 12px;
+  border-radius: 8px;
   font-size: 13px;
   font-weight: 700;
   padding: 10px 12px;
 }
 
 .plan-section {
-  background: #f8fbff;
+  background: #f7faf7;
   border: 1px solid var(--line);
-  border-radius: 20px;
+  border-radius: 8px;
   padding: 16px;
   display: grid;
   gap: 10px;
@@ -385,6 +434,31 @@ select:focus {
 
 .plan-section.two-column {
   grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.highlight-strip {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.highlight-strip div {
+  display: grid;
+  gap: 5px;
+  border-left: 3px solid var(--primary);
+  background: #fbfcfa;
+  padding: 10px 12px;
+}
+
+.highlight-strip span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.highlight-strip strong {
+  line-height: 1.55;
+  overflow-wrap: anywhere;
 }
 
 .plan-section ul,
@@ -401,7 +475,7 @@ select:focus {
 .day-card {
   background: #fff;
   border: 1px solid var(--line);
-  border-radius: 20px;
+  border-radius: 8px;
   padding: 16px;
   display: grid;
   gap: 10px;
@@ -412,13 +486,30 @@ select:focus {
   justify-content: space-between;
   gap: 12px;
   flex-wrap: wrap;
+  align-items: center;
+}
+
+.day-card-head strong {
+  background: #17231f;
+  color: #fff;
+  border-radius: 8px;
+  min-width: 72px;
+  text-align: center;
+  padding: 7px 10px;
+}
+
+.day-card-head span {
+  flex: 1;
+  min-width: 180px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
 }
 
 .day-card-head em {
   background: #ecfdf3;
   color: #15803d;
   border: 1px solid #bbf7d0;
-  border-radius: 999px;
+  border-radius: 8px;
   font-size: 12px;
   font-style: normal;
   font-weight: 700;
@@ -430,9 +521,9 @@ select:focus {
   flex-wrap: wrap;
   gap: 8px;
   align-items: center;
-  background: #f8fbff;
+  background: #f7faf7;
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: 8px;
   padding: 8px 10px;
 }
 
@@ -443,17 +534,47 @@ select:focus {
 }
 
 .weather-chip-row strong {
-  background: #dbeafe;
-  color: #1d4ed8;
-  border-radius: 999px;
+  background: #e7f4ef;
+  color: var(--primary-strong);
+  border-radius: 8px;
   font-size: 12px;
   padding: 4px 8px;
 }
 
+.weather-chip-row.rain {
+  background: #eff6ff;
+  border-color: #bfdbfe;
+}
+
+.weather-chip-row.rain strong {
+  background: #dbeafe;
+  color: var(--rain);
+}
+
+.weather-chip-row.heat {
+  background: #fff7ed;
+  border-color: #fed7aa;
+}
+
+.weather-chip-row.heat strong {
+  background: #ffedd5;
+  color: var(--heat);
+}
+
+.weather-chip-row.fallback {
+  background: #eef4f7;
+  border-color: #d6e1e7;
+}
+
+.weather-chip-row.fallback strong {
+  background: #e2e8f0;
+  color: #475569;
+}
+
 .weather-tip-panel {
-  background: #f5fbff;
-  border: 1px solid #d6e8ff;
-  border-radius: 12px;
+  background: #f7faf7;
+  border: 1px solid var(--line);
+  border-radius: 8px;
   padding: 10px 12px;
   display: grid;
   gap: 8px;
@@ -477,7 +598,7 @@ select:focus {
   background: #fff7ed;
   color: #9a3412;
   border: 1px solid #fed7aa;
-  border-radius: 999px;
+  border-radius: 8px;
   font-size: 12px;
   font-weight: 700;
   padding: 5px 9px;
@@ -490,11 +611,28 @@ select:focus {
 }
 
 .note-row span {
-  background: #eef4ff;
-  color: #2457d6;
+  background: #edf4f0;
+  color: var(--primary-strong);
   padding: 6px 10px;
-  border-radius: 999px;
+  border-radius: 8px;
   font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.day-route-meta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.day-route-meta span {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfa;
+  color: #46564f;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 6px 9px;
 }
 
 .plan-footer-grid {
@@ -505,9 +643,9 @@ select:focus {
 
 .plan-compact-block,
 .route-summary {
-  background: #f8fbff;
+  background: #f7faf7;
   border: 1px solid var(--line);
-  border-radius: 20px;
+  border-radius: 8px;
   padding: 16px;
   display: grid;
   gap: 10px;
@@ -522,7 +660,7 @@ select:focus {
   display: grid;
   gap: 4px;
   padding: 12px 14px;
-  border-radius: 14px;
+  border-radius: 8px;
   background: #fff;
   border: 1px solid var(--line);
 }
@@ -544,9 +682,9 @@ select:focus {
 
 .file-input span {
   display: block;
-  background: #f8fbff;
+  background: #f7faf7;
   border: 1px dashed #bfd0f0;
-  border-radius: 14px;
+  border-radius: 8px;
   padding: 12px 14px;
 }
 
@@ -566,7 +704,7 @@ select:focus {
 .debug-details pre {
   background: #0f172a;
   color: #dbeafe;
-  border-radius: 16px;
+  border-radius: 8px;
   padding: 12px;
   overflow: auto;
   max-height: 220px;
@@ -574,7 +712,7 @@ select:focus {
 
 .debug-details {
   border: 1px solid var(--line);
-  border-radius: 16px;
+  border-radius: 8px;
   background: #fff;
   padding: 12px 14px;
 }
@@ -616,8 +754,14 @@ select:focus {
 
   .plan-meta-grid,
   .route-meta-grid,
+  .overview-strip,
+  .highlight-strip,
   .plan-footer-grid,
   .plan-section.two-column {
     grid-template-columns: 1fr;
+  }
+
+  .result-tabs {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }

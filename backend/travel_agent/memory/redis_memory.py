@@ -10,6 +10,8 @@ from travel_agent.core.config import get_settings
 
 settings = get_settings()
 
+_MERGE_LIST_FIELDS = {'travel_preferences', 'interest_tags', 'avoid_tags', 'weather_sensitivity'}
+
 
 class RedisMemoryStore:
     def __init__(self) -> None:
@@ -18,6 +20,7 @@ class RedisMemoryStore:
         self._ttl = max(60, int(settings.memory_ttl_seconds))
         self._fallback_short_term: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self._fallback_long_term: dict[str, dict[str, Any]] = defaultdict(dict)
+        self._fallback_reason: str | None = None
         self._client = self._create_client()
 
     def _create_client(self):
@@ -25,11 +28,24 @@ class RedisMemoryStore:
             client = redis.from_url(settings.redis_url, decode_responses=True, socket_connect_timeout=0.2, socket_timeout=0.2)
             client.ping()
             return client
-        except Exception:
+        except Exception as exc:
+            self._fallback_reason = exc.__class__.__name__
             return None
 
     def _using_fallback(self) -> bool:
         return self._client is None
+
+    def status(self) -> dict[str, Any]:
+        status = {
+            'backend': 'memory_fallback' if self._using_fallback() else 'redis',
+            'connected': not self._using_fallback(),
+            'prefix': self._prefix,
+            'ttl_seconds': self._ttl,
+            'short_term_limit': self._short_term_limit,
+        }
+        if self._using_fallback() and self._fallback_reason:
+            status['fallback_reason'] = self._fallback_reason
+        return status
 
     def _short_term_key(self, conversation_id: str) -> str:
         return f'{self._prefix}:memory:{conversation_id}:short_term'
@@ -44,6 +60,27 @@ class RedisMemoryStore:
             return json.loads(raw)
         except json.JSONDecodeError:
             return fallback
+
+    def _merge_profile_patch(self, existing: dict[str, Any], profile_patch: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(existing)
+        for field, value in profile_patch.items():
+            if value is None:
+                continue
+            if field in _MERGE_LIST_FIELDS:
+                old_items = merged.get(field, [])
+                if not isinstance(old_items, list):
+                    old_items = [old_items] if old_items else []
+                new_items = value if isinstance(value, list) else [value]
+                result: list[Any] = []
+                for item in [*old_items, *new_items]:
+                    if item in (None, ''):
+                        continue
+                    if item not in result:
+                        result.append(item)
+                merged[field] = result
+            else:
+                merged[field] = value
+        return merged
 
     def get_context(self, conversation_id: str) -> dict[str, Any]:
         if self._using_fallback():
@@ -75,11 +112,13 @@ class RedisMemoryStore:
         pipe.execute()
 
     def update_profile(self, conversation_id: str, profile_patch: dict[str, Any]) -> None:
+        existing = self.get_context(conversation_id).get('long_term', {})
+        merged = self._merge_profile_patch(existing if isinstance(existing, dict) else {}, profile_patch)
         if self._using_fallback():
-            self._fallback_long_term[conversation_id].update(profile_patch)
+            self._fallback_long_term[conversation_id] = merged
             return
         key = self._long_term_key(conversation_id)
-        serialised = {field: json.dumps(value, ensure_ascii=False) for field, value in profile_patch.items()}
+        serialised = {field: json.dumps(value, ensure_ascii=False) for field, value in merged.items()}
         pipe = self._client.pipeline(transaction=False)
         if serialised:
             pipe.hset(key, mapping=serialised)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any, TypedDict
+from uuid import uuid4
 
 from langgraph.graph import END, StateGraph
 
@@ -52,6 +53,7 @@ class UnifiedAgentState(TypedDict, total=False):
     ranked_pois: dict[str, Any]
     daily_itinerary: list[Any]
     weather_context: dict[str, Any]
+    memory_store: Any
 
 
 def _meta_with_notes(meta: dict[str, Any] | None, notes: list[str]) -> dict[str, Any]:
@@ -66,7 +68,7 @@ def _meta_with_notes(meta: dict[str, Any] | None, notes: list[str]) -> dict[str,
 
 def _ensure_request(state: UnifiedAgentState) -> UnifiedAgentState:
     request = state['request']
-    conversation_id = request.conversation_id or state.get('conversation_id') or 'default'
+    conversation_id = request.conversation_id or state.get('conversation_id') or str(uuid4())
     if request.conversation_id != conversation_id:
         request = ChatRequest(**{**request.model_dump(), 'conversation_id': conversation_id})
     return {**state, 'request': request, 'conversation_id': conversation_id, 'iteration': int(state.get('iteration', 0) or 0), 'processing_notes': state.get('processing_notes', []) or []}
@@ -181,6 +183,7 @@ async def _finalize_travel_response(state: UnifiedAgentState) -> UnifiedAgentSta
         weather_context=state.get('weather_context', {}),
         ranked_pois=state.get('ranked_pois', {}),
         daily_itinerary=state.get('daily_itinerary'),
+        memory_store_override=state.get('memory_store'),  # type: ignore[arg-type]
     )
     notes = state.get('processing_notes', [])
     response = {

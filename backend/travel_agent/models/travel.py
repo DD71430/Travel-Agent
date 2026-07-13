@@ -74,6 +74,9 @@ class TripDayPlan(BaseModel):
     drive_time: str | None = None
     visit_time: str | None = None
     weather_strategy: str | None = None
+    weather_summary: str = ''
+    weather_adjustments: list[str] = Field(default_factory=list)
+    weather_badge: str | None = None
     weather_tips: list[str] = Field(default_factory=list)
     packing_tips: list[str] = Field(default_factory=list)
     weather_tags: list[str] = Field(default_factory=list)
@@ -108,6 +111,9 @@ class TravelPlanResponse(BaseModel):
     accommodation_suggestion: str = ''
     transportation_suggestion: list[str] = Field(default_factory=list)
     weather_hint: str = ''
+    weather_overview: str = ''
+    weather_adjustments: list[str] = Field(default_factory=list)
+    packing_summary: list[str] = Field(default_factory=list)
     attraction_recommendations: list[str] = Field(default_factory=list)
     hotel_candidates: list[dict[str, str]] = Field(default_factory=list)
     food_candidates: list[dict[str, str]] = Field(default_factory=list)

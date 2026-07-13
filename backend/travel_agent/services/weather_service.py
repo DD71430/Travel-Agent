@@ -33,6 +33,90 @@ def _parse_temperature_bounds(temperature_text: str | None) -> tuple[float | Non
     return min(values), max(values)
 
 
+def _weather_flags(weather_day: dict[str, Any] | None) -> dict[str, Any]:
+    day = weather_day or {}
+    weather = str(day.get('weather') or '')
+    low_temp, high_temp = _parse_temperature_bounds(str(day.get('temperature') or ''))
+    has_extreme = any(keyword in weather for keyword in _EXTREME_WEATHER)
+    has_rain = (has_extreme and any(keyword in weather for keyword in ('雨', '雷', '暴'))) or any(keyword in weather for keyword in _RAIN_WEATHER)
+    has_sun = any(keyword in weather for keyword in ('晴', '多云', '少云'))
+    has_heat = high_temp is not None and high_temp >= 30
+    has_extreme_heat = high_temp is not None and high_temp >= 35
+    return {
+        'has_extreme': has_extreme,
+        'has_rain': has_rain,
+        'has_sun': has_sun,
+        'has_heat': has_heat,
+        'has_extreme_heat': has_extreme_heat,
+        'high_temp': high_temp,
+        'low_temp': low_temp,
+    }
+
+
+def weather_badge_for_day(weather_context: dict[str, Any], weather_day: dict[str, Any] | None) -> str | None:
+    if not weather_day:
+        return None
+    day_source = str(weather_day.get('data_source') or weather_context.get('data_source') or '')
+    if day_source != 'tencent_maps':
+        return '天气待确认'
+    flags = _weather_flags(weather_day)
+    if flags['has_extreme']:
+        return '预警'
+    if flags['has_rain']:
+        return '雨天'
+    if flags['has_extreme_heat'] or flags['has_heat']:
+        return '高温'
+    if flags['has_sun']:
+        return '晴热'
+    return '天气参考'
+
+
+def build_daily_weather_brief(weather_context: dict[str, Any], weather_day: dict[str, Any] | None) -> str:
+    if not weather_day:
+        return '天气待确认，建议出行前查看实时天气；保留雨具、防晒和补水用品作为备选。'
+    city = _safe_city(str(weather_day.get('city') or weather_context.get('destination') or '目的地'))
+    day = weather_day.get('day')
+    prefix = f'第{day}天{city}' if day else city
+    day_source = str(weather_day.get('data_source') or weather_context.get('data_source') or '')
+    if day_source != 'tencent_maps':
+        return f'{prefix}天气待确认，建议出行前查看实时天气；保留雨具、防晒和补水用品作为备选。'
+    weather = str(weather_day.get('weather') or '天气待确认')
+    temperature = str(weather_day.get('temperature') or '温度待确认')
+    flags = _weather_flags(weather_day)
+    actions: list[str] = []
+    if flags['has_rain']:
+        actions.append('带伞/雨衣并注意防滑，优先室内或遮蔽点位')
+    if flags['has_heat']:
+        actions.append('防晒、补水，携带帽子或墨镜')
+    if flags['has_extreme_heat']:
+        actions.append('避开正午户外暴晒')
+    if flags['has_extreme']:
+        actions.append('减少户外、关注预警')
+    if not actions:
+        actions.append(str(weather_day.get('strategy') or '按实时天气微调室内外顺序'))
+    return f'{prefix}：{weather}，{temperature}；{"；".join(_dedupe_text(actions))}。'
+
+
+def build_daily_weather_adjustments(weather_context: dict[str, Any], weather_day: dict[str, Any] | None) -> list[str]:
+    if not weather_day:
+        return []
+    day_source = str(weather_day.get('data_source') or weather_context.get('data_source') or '')
+    if day_source != 'tencent_maps':
+        return ['天气待确认，不做确定性天气重排；建议出行前查看实时天气，保留室内/室外备选。']
+    day = weather_day.get('day')
+    city = _safe_city(str(weather_day.get('city') or weather_context.get('destination') or '目的地'))
+    prefix = f'第{day}天{city}' if day else city
+    flags = _weather_flags(weather_day)
+    adjustments: list[str] = []
+    if flags['has_rain']:
+        adjustments.append(f'{prefix}因降雨将博物馆、纪念馆、美术馆、科技馆等室内或遮蔽点位前置，湖边、公园、步道压缩游览或改为备选。')
+    if flags['has_heat']:
+        adjustments.append(f'{prefix}因高温将户外点位尽量安排在早晨或傍晚，中午安排室内景点、午餐、休整或酒店入住。')
+    if flags['has_extreme']:
+        adjustments.append(f'{prefix}存在暴雨/雷暴等风险，应减少户外停留并关注当地预警。')
+    return _dedupe_text(adjustments)
+
+
 def classify_weather_suitability(weather_text: str | None, temperature_text: str | None = None) -> dict[str, Any]:
     weather = weather_text or ''
     low_temp, high_temp = _parse_temperature_bounds(temperature_text)
@@ -139,6 +223,63 @@ def build_weather_tips(weather_day: dict[str, Any], *, data_source: str) -> dict
     }
 
 
+def build_weather_plan_summary(weather_context: dict[str, Any], daily_itinerary: list[Any]) -> dict[str, Any]:
+    daily_weather = weather_context.get('daily_weather') if isinstance(weather_context.get('daily_weather'), list) else []
+    daily_weather = [item for item in daily_weather if isinstance(item, dict)]
+    data_source = str(weather_context.get('data_source') or '')
+    has_real_weather = data_source == 'tencent_maps' or any(str(item.get('data_source') or '') == 'tencent_maps' for item in daily_weather)
+    if not has_real_weather:
+        daily_briefs = [build_daily_weather_brief(weather_context, item) for item in daily_weather]
+        if not daily_briefs:
+            daily_briefs = ['天气待确认，建议出行前查看实时天气；保留雨具、防晒和补水用品作为备选。']
+        return {
+            'weather_overview': '天气待确认，建议出行前查看实时天气；保留雨具、防晒和补水用品作为备选。',
+            'daily_weather_briefs': daily_briefs,
+            'weather_adjustments': ['天气待确认，不做确定性天气重排；建议出行前查看实时天气，保留室内/室外备选。'],
+            'packing_summary': ['雨具、防晒和补水用品作为备选'],
+        }
+
+    daily_briefs = [build_daily_weather_brief(weather_context, item) for item in daily_weather]
+    weather_adjustments = _dedupe_text([adjustment for item in daily_weather for adjustment in build_daily_weather_adjustments(weather_context, item)])
+    packing_summary: list[str] = []
+    rain_days = 0
+    heat_days = 0
+    extreme_days = 0
+    for item in daily_weather:
+        if str(item.get('data_source') or data_source) != 'tencent_maps':
+            continue
+        flags = _weather_flags(item)
+        if flags['has_rain']:
+            rain_days += 1
+            packing_summary.extend(['雨伞或轻便雨衣', '防滑鞋'])
+        if flags['has_heat']:
+            heat_days += 1
+            packing_summary.extend(['防晒霜', '水杯', '遮阳帽或墨镜'])
+        if flags['has_extreme_heat']:
+            packing_summary.append('轻薄透气衣物')
+        if flags['has_extreme']:
+            extreme_days += 1
+        explicit_packing = item.get('packing_tips') if isinstance(item.get('packing_tips'), list) else []
+        packing_summary.extend(str(tip) for tip in explicit_packing)
+    overview_parts: list[str] = []
+    if rain_days:
+        overview_parts.append(f'{rain_days}天有降雨，行程已加入带伞/雨衣、防滑和优先室内或遮蔽点位安排')
+    if heat_days:
+        overview_parts.append(f'{heat_days}天达到晴热/高温，行程已加入防晒、补水和避开正午户外暴晒安排')
+    if extreme_days:
+        overview_parts.append('存在暴雨/雷暴等风险的日期已提示减少户外、关注预警')
+    if not overview_parts:
+        overview_parts.append(str(weather_context.get('summary') or '天气风险较低，按实时天气微调室内外顺序即可'))
+    if daily_itinerary:
+        overview_parts.append(f'已覆盖{len(daily_itinerary)}天每日天气卡片')
+    return {
+        'weather_overview': '；'.join(_dedupe_text(overview_parts)) + '。',
+        'daily_weather_briefs': daily_briefs,
+        'weather_adjustments': weather_adjustments,
+        'packing_summary': _dedupe_text(packing_summary) or ['按实时天气准备常规出行装备'],
+    }
+
+
 def _safe_city(value: str | None) -> str:
     return (value or '目的地').replace('市', '').strip() or '目的地'
 
@@ -161,13 +302,16 @@ def _fallback_daily_weather(destination: str, route_stops: list[dict[str, Any]] 
                 'outdoor_suitability': 'unknown',
                 'indoor_priority': False,
                 'strategy': '天气待确认，建议出行前查看实时天气；本行程保留室内/室外备选。',
+                'data_source': 'fallback',
+                'fallback_reason': 'missing_key_or_weather_unavailable',
+                'adcode': None,
                 **tips,
             }
         )
     return daily
 
 
-def _extract_forecasts(payload: dict[str, Any], city: str, days: int) -> list[dict[str, Any]]:
+def _extract_forecasts(payload: dict[str, Any], city: str, days: int, *, start_day: int = 1, adcode: str | None = None) -> list[dict[str, Any]]:
     result = payload.get('result') if isinstance(payload, dict) else {}
     forecasts = (result or {}).get('forecast') or (result or {}).get('forecasts') or []
     if isinstance(forecasts, dict):
@@ -175,9 +319,10 @@ def _extract_forecasts(payload: dict[str, Any], city: str, days: int) -> list[di
     if not isinstance(forecasts, list):
         return []
     daily: list[dict[str, Any]] = []
-    for index, item in enumerate(forecasts[:days], start=1):
+    for offset, item in enumerate(forecasts[:days]):
         if not isinstance(item, dict):
             continue
+        index = start_day + offset
         weather = str(item.get('weather') or item.get('day_weather') or item.get('night_weather') or '天气未知')
         low = item.get('min_temperature') or item.get('min_temp') or item.get('night_air_temperature')
         high = item.get('max_temperature') or item.get('max_temp') or item.get('day_air_temperature')
@@ -191,6 +336,9 @@ def _extract_forecasts(payload: dict[str, Any], city: str, days: int) -> list[di
                 'weather': weather,
                 'temperature': temperature,
                 'wind': str(item.get('wind_direction') or item.get('wind') or '风力待确认'),
+                'data_source': 'tencent_maps',
+                'fallback_reason': None,
+                'adcode': adcode,
                 **suitability,
                 **tips,
             }
@@ -198,28 +346,62 @@ def _extract_forecasts(payload: dict[str, Any], city: str, days: int) -> list[di
     return daily
 
 
+def _route_weather_targets(destination: str, route_stops: list[dict[str, Any]] | None, days: int, location_debug: dict[str, Any] | None) -> list[dict[str, Any]]:
+    stops = [item for item in (route_stops or []) if isinstance(item, dict)]
+    destination_adcode = None
+    if isinstance(location_debug, dict):
+        destination_adcode = location_debug.get('destination_adcode') or location_debug.get('adcode')
+    targets: list[dict[str, Any]] = []
+    for index in range(days):
+        stop = stops[index] if index < len(stops) else {}
+        city = _safe_city(str(stop.get('name') or destination))
+        adcode = stop.get('adcode') or stop.get('ad_code') or stop.get('city_adcode')
+        if not adcode and isinstance(location_debug, dict):
+            adcode = location_debug.get(f'waypoint_adcode:{city}') or location_debug.get(f'waypoint_adcode:{city}市')
+        if not adcode and _safe_city(city) == _safe_city(destination):
+            adcode = destination_adcode
+        targets.append({'day': index + 1, 'city': city, 'adcode': str(adcode) if adcode else None})
+    return targets
+
+
 def build_weather_context(destination: str, route_stops: list[dict[str, Any]] | None = None, days: int = 3, location_debug: dict[str, Any] | None = None) -> dict[str, Any]:
     safe_days = max(1, days)
-    adcode = None
-    if isinstance(location_debug, dict):
-        adcode = location_debug.get('destination_adcode') or location_debug.get('adcode')
-    if settings.tencent_maps_key and adcode:
-        try:
-            payload = _client.weather_info(str(adcode))
-            daily_weather = _extract_forecasts(payload, _safe_city(destination), safe_days)
-            if daily_weather:
-                indoor_days = sum(1 for item in daily_weather if item.get('indoor_priority'))
-                summary = f'{_safe_city(destination)}未来{len(daily_weather)}天天气参考：{daily_weather[0]["weather"]}；{"建议优先安排室内景点" if indoor_days else "天气适合室外游览"}。'
-                return {
-                    'data_source': 'tencent_maps',
-                    'destination': destination,
-                    'summary': summary,
-                    'daily_weather': daily_weather,
-                    'warnings': [],
-                    'request_debug': {'provider': 'tencent_maps', 'fallback_reason': None},
-                }
-        except TencentWebServiceError:
-            pass
+    targets = _route_weather_targets(destination, route_stops, safe_days, location_debug)
+    if settings.tencent_maps_key and any(target.get('adcode') for target in targets):
+        daily_weather: list[dict[str, Any]] = []
+        for target in targets:
+            adcode = target.get('adcode')
+            if not adcode:
+                fallback = _fallback_daily_weather(str(target.get('city') or destination), [], 1)[0]
+                fallback.update({'day': target['day'], 'city': target.get('city') or destination, 'fallback_reason': 'missing_adcode'})
+                daily_weather.append(fallback)
+                continue
+            try:
+                payload = _client.weather_info(str(adcode))
+                extracted = _extract_forecasts(payload, str(target.get('city') or destination), 1, start_day=int(target['day']), adcode=str(adcode))
+                if extracted:
+                    daily_weather.extend(extracted)
+                    continue
+                fallback_reason = 'empty_weather_forecast'
+            except TencentWebServiceError:
+                fallback_reason = 'weather_service_error'
+            fallback = _fallback_daily_weather(str(target.get('city') or destination), [], 1)[0]
+            fallback.update({'day': target['day'], 'city': target.get('city') or destination, 'fallback_reason': fallback_reason})
+            daily_weather.append(fallback)
+        if daily_weather and any(item.get('data_source') == 'tencent_maps' for item in daily_weather):
+            all_real = all(item.get('data_source') == 'tencent_maps' for item in daily_weather)
+            indoor_days = sum(1 for item in daily_weather if item.get('indoor_priority'))
+            weather_samples = '、'.join(_dedupe_text([str(item.get('weather') or '') for item in daily_weather[:3] if item.get('weather')]))
+            summary = f'{_safe_city(destination)}未来{len(daily_weather)}天天气参考：{weather_samples or daily_weather[0]["weather"]}；{"建议优先安排室内景点" if indoor_days else "天气适合室外游览"}。'
+            fallback_reasons = _dedupe_text([str(item.get('fallback_reason')) for item in daily_weather if item.get('fallback_reason')])
+            return {
+                'data_source': 'tencent_maps' if all_real else 'mixed',
+                'destination': destination,
+                'summary': summary,
+                'daily_weather': daily_weather,
+                'warnings': [] if all_real else ['weather_partial_fallback'],
+                'request_debug': {'provider': 'tencent_maps' if all_real else 'mixed', 'fallback_reason': None if all_real else 'partial_fallback', 'daily_fallback_reasons': fallback_reasons},
+            }
     daily_weather = _fallback_daily_weather(destination, route_stops, safe_days)
     return {
         'data_source': 'fallback',
