@@ -354,6 +354,26 @@ select:focus {
   word-break: break-word;
 }
 
+.fallback-banner {
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
+  color: #9a3412;
+  border-radius: 12px;
+  font-size: 13px;
+  font-weight: 700;
+  padding: 10px 12px;
+}
+
+.weather-banner {
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  color: #1d4ed8;
+  border-radius: 12px;
+  font-size: 13px;
+  font-weight: 700;
+  padding: 10px 12px;
+}
+
 .plan-section {
   background: #f8fbff;
   border: 1px solid var(--line);
@@ -392,6 +412,42 @@ select:focus {
   justify-content: space-between;
   gap: 12px;
   flex-wrap: wrap;
+}
+
+.day-card-head em {
+  background: #ecfdf3;
+  color: #15803d;
+  border: 1px solid #bbf7d0;
+  border-radius: 999px;
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 700;
+  padding: 4px 9px;
+}
+
+.weather-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  background: #f8fbff;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 8px 10px;
+}
+
+.weather-chip-row span,
+.weather-chip-row small {
+  color: #33445d;
+  font-size: 12px;
+}
+
+.weather-chip-row strong {
+  background: #dbeafe;
+  color: #1d4ed8;
+  border-radius: 999px;
+  font-size: 12px;
+  padding: 4px 8px;
 }
 
 .note-row {

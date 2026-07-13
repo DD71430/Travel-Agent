@@ -14,6 +14,7 @@ from travel_agent.services.intent_service import (
     extract_weather_preferences,
 )
 from travel_agent.services.trip_profile_service import build_trip_profile_from_text
+from travel_agent.services.waypoint_service import extract_must_visit_attractions, extract_waypoint_details, extract_waypoint_order_mode
 
 
 def build_preference_summary(question: str, existing_preferences: str | None, travel_mode: str, trip_details: dict[str, str | None]) -> str:
@@ -48,7 +49,7 @@ def build_preference_summary(question: str, existing_preferences: str | None, tr
     return '；'.join(deduped)
 
 
-def parse_waypoints(raw: str | None) -> list[dict[str, str]]:
+def parse_waypoints(raw: str | None) -> list[dict[str, object]]:
     if not raw:
         return []
     try:
@@ -57,10 +58,17 @@ def parse_waypoints(raw: str | None) -> list[dict[str, str]]:
         return []
     if not isinstance(parsed, list):
         return []
-    waypoints: list[dict[str, str]] = []
+    waypoints: list[dict[str, object]] = []
     for item in parsed:
         if isinstance(item, dict) and item.get('name'):
-            waypoints.append({'name': str(item['name']).strip()})
+            waypoints.append(
+                {
+                    'name': str(item['name']).strip(),
+                    'type': str(item.get('type') or 'unknown'),
+                    'must_visit': bool(item.get('must_visit') or False),
+                    'source': str(item.get('source') or 'form'),
+                }
+            )
     return [item for item in waypoints if item['name']]
 
 
@@ -84,6 +92,9 @@ def build_travel_request(request: ChatRequest) -> TravelPlanRequest:
     question_text = request.question or ''
     merged_preference_text = '；'.join(part for part in [preference_text, question_text] if part)
     parsed_profile = build_trip_profile_from_text(merged_preference_text, origin=origin, destination=destination, travel_mode=travel_mode)
+    waypoint_details = extract_waypoint_details(question_text)
+    must_visit_attractions = extract_must_visit_attractions(question_text)
+    waypoint_order_mode = extract_waypoint_order_mode(question_text)
     trip_profile = {
         'duration_days': parsed_profile.get('duration_days') or (int(trip_details['duration_days']) if trip_details['duration_days'] else None),
         'nights': parsed_profile.get('nights'),
@@ -94,12 +105,37 @@ def build_travel_request(request: ChatRequest) -> TravelPlanRequest:
         'avoid_tags': parsed_profile.get('avoid_tags', []),
         'pace': parsed_profile.get('pace', 'normal'),
         'trip_type': parsed_profile.get('trip_type', 'destination_trip'),
+        'route_days': parsed_profile.get('route_days'),
+        'destination_days': parsed_profile.get('destination_days'),
+        'route_nights': parsed_profile.get('route_nights'),
+        'destination_nights': parsed_profile.get('destination_nights'),
+        'total_days_source': parsed_profile.get('total_days_source'),
+        'stage_plan_mode': parsed_profile.get('stage_plan_mode'),
+        'explicit_total_days': parsed_profile.get('explicit_total_days'),
+        'waypoint_details': waypoint_details,
+        'must_visit_attractions': must_visit_attractions,
+        'waypoint_order_mode': waypoint_order_mode,
     }
-    merged_waypoints: list[dict[str, str]] = []
-    for item in [*parse_waypoints(request.waypoints_json), *extract_question_waypoints(question_text)]:
+    merged_waypoints: list[dict[str, object]] = []
+    for item in [*parse_waypoints(request.waypoints_json), *extract_question_waypoints(question_text), *waypoint_details]:
         name = str(item.get('name', '')).strip()
         if name and not any(existing['name'] == name for existing in merged_waypoints):
-            merged_waypoints.append({'name': name})
+            merged_waypoints.append(
+                {
+                    'name': name,
+                    'type': item.get('type') or 'unknown',
+                    'must_visit': bool(item.get('must_visit') or name in must_visit_attractions),
+                    'source': item.get('source') or 'parsed',
+                }
+            )
+    for name in must_visit_attractions:
+        if not any(existing['name'] == name for existing in merged_waypoints):
+            merged_waypoints.append({'name': name, 'type': 'attraction', 'must_visit': True, 'source': 'parsed'})
+    waypoint_order = bool(request.waypoint_order) if request.waypoint_order is not None else False
+    if waypoint_order_mode == 'user_order':
+        waypoint_order = False
+    elif waypoint_order_mode == 'optimize':
+        waypoint_order = True
     return TravelPlanRequest(
         origin=origin,
         destination=destination,
@@ -108,7 +144,7 @@ def build_travel_request(request: ChatRequest) -> TravelPlanRequest:
         source_query=source_query,
         conversation_id=request.conversation_id,
         waypoints=merged_waypoints,
-        waypoint_order=bool(request.waypoint_order) if request.waypoint_order is not None else False,
+        waypoint_order=waypoint_order,
         request_source='chat',
         trip_profile=trip_profile,
     )

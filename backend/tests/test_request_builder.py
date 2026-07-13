@@ -27,3 +27,15 @@ def test_waypoints_json_parsing():
     request = ChatRequest(question='从济南到北京途经泰安', waypoints_json='[{"name":"曲阜"}]')
     travel_request = build_travel_request(request)
     assert [item.name for item in travel_request.waypoints] == ['曲阜', '泰安']
+
+
+def test_request_builder_carries_parsed_waypoints_and_must_visit():
+    request = ChatRequest(question='从济南自驾到成都，途经西安和汉中，沿途必须去龙门石窟，按我输入的顺序走')
+    result = build_travel_request(request)
+    waypoint_names = [waypoint.name for waypoint in result.waypoints]
+    assert '西安' in waypoint_names
+    assert '汉中' in waypoint_names
+    assert '龙门石窟' in waypoint_names
+    assert '龙门石窟' in result.trip_profile['must_visit_attractions']
+    assert result.trip_profile['waypoint_order_mode'] == 'user_order'
+    assert result.waypoint_order is False

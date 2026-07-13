@@ -5,6 +5,10 @@ from pydantic import BaseModel, Field
 
 class Waypoint(BaseModel):
     name: str = Field(..., description='途经点名称或坐标')
+    type: Literal['city', 'attraction', 'poi', 'unknown'] = 'unknown'
+    must_visit: bool = False
+    preferred_day: int | None = None
+    source: Literal['user', 'form', 'parsed', 'fallback'] = 'user'
 
 
 class TravelPlanRequest(BaseModel):
@@ -63,6 +67,7 @@ class RouteOption(BaseModel):
 class TripDayPlan(BaseModel):
     day: int
     title: str
+    stage: Literal['route', 'destination', 'buffer'] | str = 'destination'
     route_segment: str | None = None
     drive_time: str | None = None
     visit_time: str | None = None

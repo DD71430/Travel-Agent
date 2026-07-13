@@ -44,6 +44,28 @@ type RouteDebug = {
   hotel_candidates?: { name: string; address?: string; category?: string; location?: string }[]
   food_candidates?: { name: string; address?: string; category?: string; location?: string }[]
   request_debug?: Record<string, unknown>
+  trip_profile?: Record<string, unknown>
+  weather_context?: WeatherContext
+  waypoint_details?: WaypointDetail[]
+  must_visit_attractions?: string[]
+  waypoint_order_mode?: string
+  unscheduled_waypoints?: string[]
+}
+
+type WeatherDay = {
+  day?: number
+  city?: string
+  weather?: string
+  temperature?: string
+  outdoor_suitability?: string
+  indoor_priority?: boolean
+  strategy?: string
+}
+
+type WeatherContext = {
+  data_source?: string
+  summary?: string
+  daily_weather?: WeatherDay[]
 }
 
 type ConversationTurn = {
@@ -55,16 +77,25 @@ type Waypoint = {
   name: string
 }
 
+type WaypointDetail = {
+  name: string
+  type?: string
+  must_visit?: boolean
+  source?: string
+  order?: number
+}
+
 type TripDayPlan = {
   day: number
   title: string
+  stage?: 'route' | 'destination' | 'buffer' | string
   route_segment?: string
   drive_time?: string
   visit_time?: string
   morning: string
   afternoon: string
   evening: string
-  attractions?: { name: string; address?: string; category?: string; reason?: string; tags?: string }[]
+  attractions?: { name: string; address?: string; category?: string; reason?: string; tags?: string; must_visit?: string }[]
   meals?: string[]
   hotel_hint?: string | null
   recommendation_reasons?: string[]
@@ -137,7 +168,7 @@ type TravelRequestDebug = {
   travel_mode?: string
   preferences?: string | null
   source_query?: string | null
-  trip_profile?: Record<string, string | number | null>
+  trip_profile?: Record<string, unknown>
   waypoint_order?: boolean
   waypoints?: Waypoint[]
 }
@@ -288,6 +319,45 @@ function createQuickPrompt(mode: 'travel' | 'nearby') {
   return prompts[mode]
 }
 
+function getTripTypeLabel(value?: string, stageMode?: unknown) {
+  if (stageMode === 'route_then_destination') return '沿途 + 目的地'
+  if (stageMode === 'destination_only') return '目的地深度游'
+  if (stageMode === 'route_only') return '沿途游'
+  if (value === 'along_route_trip') return '沿途游'
+  if (value === 'destination_trip') return '目的地游'
+  return value || '未分类'
+}
+
+function getStageLabel(value?: string) {
+  if (value === 'route') return '沿途阶段'
+  if (value === 'destination') return '目的地阶段'
+  if (value === 'buffer') return '机动/返程'
+  return '行程阶段'
+}
+
+function getProfileNumber(profile: Record<string, unknown> | null | undefined, key: string) {
+  const value = profile?.[key]
+  if (typeof value === 'number') return value
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  return null
+}
+
+function getWeatherBadge(day?: WeatherDay) {
+  if (!day) return '天气待确认'
+  if (day.indoor_priority) return '室内优先'
+  if (day.outdoor_suitability === 'good') return '室外适合'
+  return '天气参考'
+}
+
+function getWaypointOrderLabel(value?: string) {
+  if (value === 'user_order') return '按输入顺序'
+  if (value === 'optimize') return '系统优化'
+  return '未指定'
+}
+
 function ToolChip({ label, onClick }: { label: string; onClick: () => void }) {
   return (
     <button type="button" className="chip" onClick={onClick}>
@@ -298,6 +368,19 @@ function ToolChip({ label, onClick }: { label: string; onClick: () => void }) {
 
 function PlanCard({ plan }: { plan: TravelPlanResponse }) {
   const routeDebug = isObject(plan.raw_route) ? (plan.raw_route as RouteDebug) : null
+  const tripProfile = isObject(routeDebug?.trip_profile)
+    ? routeDebug?.trip_profile
+    : isObject(routeDebug?.request_debug)
+      ? routeDebug?.request_debug
+      : null
+  const routeDays = getProfileNumber(tripProfile, 'route_days')
+  const destinationDays = getProfileNumber(tripProfile, 'destination_days')
+  const bufferDays = getProfileNumber(tripProfile, 'buffer_days')
+  const weatherContext = isObject(routeDebug?.weather_context) ? routeDebug?.weather_context : null
+  const dailyWeather = Array.isArray(weatherContext?.daily_weather) ? weatherContext?.daily_weather : []
+  const waypointDetails = Array.isArray(routeDebug?.waypoint_details) ? routeDebug?.waypoint_details : []
+  const mustVisitAttractions = Array.isArray(routeDebug?.must_visit_attractions) ? routeDebug?.must_visit_attractions : []
+  const unscheduledWaypoints = Array.isArray(routeDebug?.unscheduled_waypoints) ? routeDebug?.unscheduled_waypoints : []
   const routeHighlights = plan.route_highlights || []
   const scenicTexts = plan.attraction_recommendations || []
   return (
@@ -309,15 +392,31 @@ function PlanCard({ plan }: { plan: TravelPlanResponse }) {
         </div>
         <span className="status-badge">{getDataSourceLabel(plan.data_source)}</span>
       </div>
+      {plan.data_source && plan.data_source !== 'tencent_maps' ? (
+        <div className="fallback-banner">当前为兜底规划，真实路线、营业时间和票务信息请以出行前查询为准。</div>
+      ) : null}
+      {weatherContext?.data_source === 'fallback' ? (
+        <div className="weather-banner">天气为兜底参考，请以出行前实时天气为准。</div>
+      ) : null}
+      {unscheduledWaypoints.length ? (
+        <div className="fallback-banner">未安排途经点/景点：{unscheduledWaypoints.join('、')}。建议延长停留或作为备选。</div>
+      ) : null}
 
       <div className="plan-meta-grid">
         <div><span>意图</span><strong>{plan.intent}</strong></div>
         <div><span>场景</span><strong>{plan.scenario}</strong></div>
+        <div><span>行程类型</span><strong>{getTripTypeLabel(plan.trip_type, tripProfile?.stage_plan_mode)}</strong></div>
         <div><span>天数</span><strong>{plan.duration_days || '--'} 天</strong></div>
+        <div><span>沿途天数</span><strong>{routeDays ?? 0} 天</strong></div>
+        <div><span>目的地天数</span><strong>{destinationDays ?? 0} 天</strong></div>
+        {bufferDays ? <div><span>机动天数</span><strong>{bufferDays} 天</strong></div> : null}
         <div><span>出行方式</span><strong>{String(routeDebug?.request_debug?.travel_mode || '--')}</strong></div>
         <div><span>总距离</span><strong>{plan.route_total_distance || routeDebug?.best_option?.distance || '--'}</strong></div>
         <div><span>总耗时</span><strong>{plan.route_total_duration || routeDebug?.best_option?.duration || '--'}</strong></div>
         <div><span>天气参考</span><strong>{plan.weather_hint || '以出行前最新天气为准'}</strong></div>
+        <div><span>途经点</span><strong>{waypointDetails.length ? waypointDetails.map((item) => item.name).join('、') : '--'}</strong></div>
+        <div><span>必去景点</span><strong>{mustVisitAttractions.length ? mustVisitAttractions.join('、') : '--'}</strong></div>
+        <div><span>顺序模式</span><strong>{getWaypointOrderLabel(routeDebug?.waypoint_order_mode)}</strong></div>
       </div>
 
       <div className="highlight-strip">
@@ -327,7 +426,7 @@ function PlanCard({ plan }: { plan: TravelPlanResponse }) {
         </div>
         <div>
           <span>天气策略</span>
-          <strong>{plan.weather_hint || '根据实时天气动态调整室内外景点'}</strong>
+          <strong>{weatherContext?.summary || plan.weather_hint || '根据实时天气动态调整室内外景点'}</strong>
         </div>
         <div>
           <span>景点串联</span>
@@ -362,9 +461,20 @@ function PlanCard({ plan }: { plan: TravelPlanResponse }) {
       <div className="itinerary-list">
         {(plan.daily_itinerary || []).map((day) => (
           <article key={day.day} className="day-card">
+            {(() => {
+              const weatherDay = dailyWeather[day.day - 1]
+              return weatherDay ? (
+                <div className="weather-chip-row">
+                  <span>{weatherDay.city || '目的地'} · {weatherDay.weather || '天气待确认'} · {weatherDay.temperature || '温度待确认'}</span>
+                  <strong>{getWeatherBadge(weatherDay)}</strong>
+                  {weatherDay.strategy ? <small>{weatherDay.strategy}</small> : null}
+                </div>
+              ) : null
+            })()}
             <div className="day-card-head">
               <strong>第{day.day}天</strong>
               <span>{day.title}</span>
+              <em>{getStageLabel(day.stage)}</em>
             </div>
             <p><b>路线段：</b>{day.route_segment || '按当日景点顺序串联'}；<b>行驶/转场：</b>{day.drive_time || '按实时路况'}；<b>可游玩：</b>{day.visit_time || '约半天至全天'}</p>
             <p><b>上午：</b>{day.morning}</p>
@@ -372,7 +482,7 @@ function PlanCard({ plan }: { plan: TravelPlanResponse }) {
             <p><b>晚上：</b>{day.evening}</p>
             {day.attractions?.length ? (
               <div className="note-row">
-                {day.attractions.map((item) => <span key={`${day.day}-${item.name}`}>{item.name}{item.tags ? ` · ${item.tags}` : ''}</span>)}
+                {day.attractions.map((item) => <span key={`${day.day}-${item.name}`}>{item.name}{item.must_visit === 'true' ? ' · 必去' : ''}{item.tags ? ` · ${item.tags}` : ''}</span>)}
               </div>
             ) : null}
             {day.recommendation_reasons?.length ? (

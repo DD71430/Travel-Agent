@@ -17,7 +17,15 @@ from travel_agent.models.travel import (
     TravelPlanRequest,
     TravelPlanResponse,
 )
+from travel_agent.services.poi_candidate_service import (
+    fetch_destination_poi_candidates,
+    fetch_hotel_candidates,
+    fetch_meal_candidates,
+    fetch_route_poi_candidates,
+)
+from travel_agent.services.route_stop_service import infer_route_stops
 from travel_agent.services.trip_profile_service import build_trip_profile, decide_trip_type, score_poi
+from travel_agent.services.weather_service import build_weather_context
 from travel_agent.tools.tencent_webservice_client import TencentWebServiceClient, TencentWebServiceError
 
 settings = get_settings()
@@ -505,6 +513,97 @@ def _fetch_tencent_route_options(request: TravelPlanRequest, scenario: str) -> t
     return options, 'tencent_maps', None, location_debug
 
 
+def fetch_route_options(request: TravelPlanRequest, profile: dict[str, Any] | None = None) -> tuple[list[RouteOption], str, str | None, dict[str, str]]:
+    return _fetch_tencent_route_options(request, _classify_scenario(request))
+
+
+def build_route_context(request: TravelPlanRequest, profile: dict[str, Any], route_options: list[RouteOption], data_source: str, location_debug: dict[str, Any]) -> dict[str, Any]:
+    best_option = _choose_best_option(route_options, request)
+    return _build_route_context(request, best_option, profile, location_debug, data_source)
+
+
+def fetch_poi_candidates(request: TravelPlanRequest, profile: dict[str, Any], route_context: dict[str, Any], location_debug: dict[str, Any] | None = None) -> dict[str, Any]:
+    stage_counts = route_context.get('stage_counts') if isinstance(route_context.get('stage_counts'), dict) else {}
+    route_days = int(stage_counts.get('route_days') or profile.get('route_days') or 0)
+    waypoint_details = [dict(item) for item in profile.get('waypoint_details') or [] if isinstance(item, dict)]
+    request_waypoints = [item.model_dump() for item in request.waypoints]
+    merged_waypoints: list[dict[str, Any]] = []
+    for item in [*request_waypoints, *waypoint_details]:
+        name = str(item.get('name') or '').strip()
+        if name and not any(existing.get('name') == name for existing in merged_waypoints):
+            merged_waypoints.append(item)
+    enriched_profile = {**profile, 'destination': request.destination}
+    route_stops = infer_route_stops(
+        request.origin,
+        request.destination,
+        route_days,
+        waypoints=merged_waypoints,
+        route_context=route_context,
+    )
+    route_candidates = fetch_route_poi_candidates(route_stops, enriched_profile, route_context)
+    destination_candidates = fetch_destination_poi_candidates(request.destination, enriched_profile, route_context)
+    anchor_points = route_stops + [{'name': request.destination, 'type': 'destination'}]
+    return {
+        'route_stops': route_stops,
+        'route_candidates': route_candidates,
+        'destination_candidates': destination_candidates,
+        'hotel_candidates': fetch_hotel_candidates(anchor_points, profile),
+        'food_candidates': fetch_meal_candidates(anchor_points, profile),
+        'candidate_debug': {
+            'route_days': route_days,
+            'destination': request.destination,
+            'data_source': route_context.get('data_source') or 'fallback',
+        },
+    }
+
+
+def rank_poi_candidates(poi_candidates: dict[str, Any], profile: dict[str, Any], route_context: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    ranked: dict[str, list[dict[str, Any]]] = {}
+    weather_context = route_context.get('weather_context') if isinstance(route_context.get('weather_context'), dict) else {}
+    daily_weather = weather_context.get('daily_weather') if isinstance(weather_context, dict) else []
+    first_weather = daily_weather[0] if isinstance(daily_weather, list) and daily_weather else None
+    for key, stage in (('route_candidates', 'route'), ('destination_candidates', 'destination')):
+        scored: list[dict[str, Any]] = []
+        for item in poi_candidates.get(key, []) or []:
+            enriched = dict(item)
+            score = score_poi(enriched, profile, {**route_context, 'stage': stage, 'weather_day': first_weather, 'daily_available_visit_minutes': enriched.get('estimated_minutes') or 240})
+            enriched['score'] = score['final_score']
+            enriched['reason'] = score['reason']
+            enriched['tags'] = '、'.join(str(tag) for tag in score.get('tags', [])) if isinstance(score.get('tags'), list) else ''
+            scored.append(enriched)
+        ranked[key] = sorted(scored, key=lambda item: float(item.get('score') or 0), reverse=True)
+    return ranked
+
+
+def build_daily_itinerary(
+    request: TravelPlanRequest,
+    profile: dict[str, Any],
+    route_context: dict[str, Any],
+    ranked_pois: dict[str, list[dict[str, Any]]],
+    route_options: list[RouteOption],
+    weather_hint: str | None = None,
+    hotel_candidates: list[dict[str, str]] | None = None,
+    food_candidates: list[dict[str, str]] | None = None,
+) -> list[TripDayPlan]:
+    best_option = _choose_best_option(route_options, request)
+    attraction_names = _dedupe_text(
+        [
+            *[str(item.get('name')) for item in ranked_pois.get('route_candidates', []) if item.get('name')],
+            *[str(item.get('name')) for item in ranked_pois.get('destination_candidates', []) if item.get('name')],
+        ]
+    )
+    return _build_trip_itinerary(
+        request,
+        profile,
+        best_option,
+        attraction_names,
+        weather_hint or f'建议出行前查看{request.destination}未来 7 天天气。',
+        route_context,
+        hotel_candidates,
+        food_candidates,
+    )
+
+
 
 def _choose_best_option(options: list[RouteOption], request: TravelPlanRequest) -> RouteOption:
     if request.preferences and '少换乘' in request.preferences and len(options) > 1:
@@ -539,16 +638,100 @@ def _duration_text_to_minutes(text: str | None) -> int:
     return _parse_duration_minutes(text)
 
 
+def _int_or_none(value: Any) -> int | None:
+    try:
+        if value is None or value == '':
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_stage_counts(profile: dict[str, Any]) -> dict[str, Any]:
+    total_days = max(1, int(profile.get('duration_days') or 1))
+    route_days = _int_or_none(profile.get('route_days'))
+    destination_days = _int_or_none(profile.get('destination_days'))
+    explicit_total = _int_or_none(profile.get('explicit_total_days'))
+    stage_mode = str(profile.get('stage_plan_mode') or 'mixed_unspecified')
+    notes: list[str] = []
+
+    if route_days is None and destination_days is None:
+        if profile.get('trip_type') == 'along_route_trip':
+            route_days = total_days
+            destination_days = 0
+            stage_mode = 'route_only'
+        else:
+            route_days = 0
+            destination_days = total_days
+            stage_mode = 'destination_only'
+    elif route_days is None:
+        route_days = max(0, total_days - max(0, destination_days or 0))
+    elif destination_days is None:
+        destination_days = max(0, total_days - max(0, route_days))
+
+    route_days = max(0, route_days or 0)
+    destination_days = max(0, destination_days or 0)
+    stage_sum = route_days + destination_days
+    if explicit_total is not None and explicit_total > stage_sum:
+        total_days = explicit_total
+        notes.append(f'用户明确总共{explicit_total}天，阶段合计{stage_sum}天，已保留{explicit_total - stage_sum}天作为机动/返程缓冲。')
+    elif explicit_total is not None and explicit_total < stage_sum:
+        notes.append(f'用户明确总共{explicit_total}天，但阶段拆分合计{stage_sum}天，已按阶段天数重新计算。')
+        total_days = stage_sum
+    elif stage_sum > total_days:
+        notes.append(f'阶段拆分合计{stage_sum}天超过原始总天数{total_days}天，已按阶段天数重新计算。')
+        total_days = stage_sum
+    elif stage_sum and stage_sum < total_days:
+        notes.append(f'阶段拆分合计{stage_sum}天，剩余{total_days - stage_sum}天作为机动/返程缓冲。')
+
+    buffer_days = max(0, total_days - stage_sum)
+    if route_days > 0 and destination_days > 0:
+        stage_mode = 'route_then_destination'
+    elif route_days > 0:
+        stage_mode = 'route_only'
+    elif destination_days > 0:
+        stage_mode = 'destination_only'
+    return {
+        'total_days': total_days,
+        'route_days': route_days,
+        'destination_days': destination_days,
+        'buffer_days': buffer_days,
+        'stage_plan_mode': stage_mode,
+        'stage_notes': notes,
+    }
+
+
 def _build_route_context(request: TravelPlanRequest, best_option: RouteOption, profile: dict[str, Any], location_debug: dict[str, Any], data_source: str) -> dict[str, Any]:
     total_minutes = _duration_text_to_minutes(best_option.duration)
     total_meters = _distance_text_to_meters(best_option.distance)
-    days = max(1, int(profile.get('duration_days') or 1))
-    daily_drive_minutes = _estimate_drive_segments(total_minutes, days)
+    stage_counts = _resolve_stage_counts(profile)
+    days = int(stage_counts['total_days'])
+    route_days = int(stage_counts['route_days'])
+    destination_days = int(stage_counts['destination_days'])
+    daily_drive_minutes = _estimate_drive_segments(total_minutes, max(1, route_days)) if route_days else []
     daily_context: list[dict[str, Any]] = []
-    for index, drive_minutes in enumerate(daily_drive_minutes, start=1):
+    for index in range(1, days + 1):
+        if index <= route_days:
+            stage = 'route'
+            stage_day = index
+            drive_minutes = daily_drive_minutes[index - 1] if index - 1 < len(daily_drive_minutes) else 0
+        elif index <= route_days + destination_days:
+            stage = 'destination'
+            stage_day = index - route_days
+            drive_minutes = 20 if index == route_days + 1 and route_days > 0 else 0
+        else:
+            stage = 'buffer'
+            stage_day = index - route_days - destination_days
+            drive_minutes = min(90, max(0, total_minutes // max(1, days))) if index == days else 0
         activity_minutes = 600 if profile.get('pace') == 'intensive' else 540 if profile.get('pace') == 'normal' else 480
         available = max(90, activity_minutes - drive_minutes)
-        if request.travel_mode == 'driving' and drive_minutes > 300:
+        if stage == 'buffer':
+            recommended_spots = 1
+        elif stage == 'destination' and profile.get('pace') == 'relaxed':
+            recommended_spots = 2
+        elif stage == 'destination':
+            recommended_spots = 3 if available >= 300 else 2
+        elif request.travel_mode == 'driving' and drive_minutes > 300:
             recommended_spots = 1
         elif request.travel_mode == 'driving' and drive_minutes >= 120:
             recommended_spots = 2
@@ -559,6 +742,8 @@ def _build_route_context(request: TravelPlanRequest, best_option: RouteOption, p
         daily_context.append(
             {
                 'day': index,
+                'stage': stage,
+                'stage_day': stage_day,
                 'daily_drive_minutes': drive_minutes,
                 'daily_available_visit_minutes': available,
                 'recommended_spots': recommended_spots,
@@ -574,6 +759,7 @@ def _build_route_context(request: TravelPlanRequest, best_option: RouteOption, p
         'route_total_distance_meters': total_meters,
         'route_total_duration': best_option.duration,
         'route_total_distance': best_option.distance,
+        'stage_counts': stage_counts,
         'daily_plan_context': daily_context,
         'origin_point': location_debug.get('origin_point'),
         'destination_point': location_debug.get('destination_point'),
@@ -641,6 +827,16 @@ def _extract_trip_profile(request: TravelPlanRequest) -> dict[str, Any]:
         'avoid_tags': base_profile.get('avoid_tags', []),
         'pace': base_profile.get('pace', 'normal'),
         'trip_type': base_profile.get('trip_type', 'destination_trip'),
+        'route_days': base_profile.get('route_days'),
+        'destination_days': base_profile.get('destination_days'),
+        'route_nights': base_profile.get('route_nights'),
+        'destination_nights': base_profile.get('destination_nights'),
+        'total_days_source': base_profile.get('total_days_source'),
+        'stage_plan_mode': base_profile.get('stage_plan_mode'),
+        'explicit_total_days': base_profile.get('explicit_total_days'),
+        'waypoint_details': base_profile.get('waypoint_details', []),
+        'must_visit_attractions': base_profile.get('must_visit_attractions', []),
+        'waypoint_order_mode': base_profile.get('waypoint_order_mode', 'unspecified'),
     }
 
 
@@ -1328,12 +1524,19 @@ def _build_trip_itinerary(
     travel_style = profile['travel_style']
     preferences = request.preferences or ''
     attraction_pool = _pick_attractions(destination, attractions, preferences, max(days * 4, 8))
+    must_visit_names = [str(item) for item in profile.get('must_visit_attractions') or [] if str(item).strip()]
+    for name in reversed(must_visit_names):
+        if name not in attraction_pool:
+            attraction_pool.insert(0, name)
     attraction_pois = _resolve_attraction_pois(destination, attraction_pool[:min(max(days * 2, 5), 7)])
     scored_attraction_pois: list[dict[str, str]] = []
     for index, poi in enumerate(attraction_pois):
         enriched = dict(poi)
         enriched['route_order'] = str(index)
         enriched['estimated_minutes'] = str(_estimate_attraction_duration(enriched.get('name', ''), enriched.get('category'))[0])
+        if enriched.get('name') in must_visit_names:
+            enriched['must_visit'] = 'true'
+            enriched['reason_hint'] = '用户指定必去'
         score = score_poi(enriched, profile, route_context)
         enriched['score'] = str(score['final_score'])
         enriched['reason'] = str(score['reason'])
@@ -1344,12 +1547,19 @@ def _build_trip_itinerary(
     total_drive_minutes = _parse_duration_minutes(best_option.duration)
     drive_segments = _estimate_drive_segments(total_drive_minutes, days)
     used_attractions: set[str] = set()
+    stage_counts = route_context.get('stage_counts') if isinstance(route_context.get('stage_counts'), dict) else {}
+    stage_notes = [str(item) for item in stage_counts.get('stage_notes', [])] if isinstance(stage_counts, dict) else []
+    weather_context = route_context.get('weather_context') if isinstance(route_context.get('weather_context'), dict) else {}
+    daily_weather = weather_context.get('daily_weather') if isinstance(weather_context, dict) else []
     for day in range(1, days + 1):
         if '轻松' in travel_style or '老人' in preferences or '亲子' in preferences:
             pace_note = '节奏偏轻松，建议每个景点之间预留休息与机动时间。'
         else:
             pace_note = '节奏为经典游览强度，建议把核心景点放在上午与下午前段完成。'
         day_context = next((item for item in route_context.get('daily_plan_context', []) if item.get('day') == day), {})
+        weather_day = daily_weather[day - 1] if isinstance(daily_weather, list) and day - 1 < len(daily_weather) and isinstance(daily_weather[day - 1], dict) else None
+        stage = str(day_context.get('stage') or 'destination')
+        stage_day = int(day_context.get('stage_day') or day)
         drive_today = int(day_context.get('daily_drive_minutes') or 0)
         available_visit_minutes = int(day_context.get('daily_available_visit_minutes') or 300)
         recommended_spots = max(1, min(3, int(day_context.get('recommended_spots') or 3)))
@@ -1376,6 +1586,10 @@ def _build_trip_itinerary(
         evening_poi = _select_poi_for_day(evening_candidates or base_candidates, evening_spot, day + 1, afternoon_poi.get('location') if afternoon_poi else (morning_poi.get('location') if morning_poi else None))
         if not drive_today:
             drive_today = drive_segments[min(day - 1, len(drive_segments) - 1)] if drive_segments else 0
+        if stage == 'destination':
+            drive_today = min(drive_today, 45)
+        elif stage == 'buffer':
+            drive_today = min(drive_today, 90)
         morning_name = (morning_poi or {}).get('name') or morning_spot
         afternoon_name = (afternoon_poi or {}).get('name') or afternoon_spot
         evening_name = (evening_poi or {}).get('name') or evening_spot
@@ -1392,14 +1606,38 @@ def _build_trip_itinerary(
         move_1_text = '两点距离较近，建议步行或短途接驳。' if transfer_1 == 20 else '两点之间建议预留 30-40 分钟交通切换。'
         move_2_text = '傍晚景点与下午景点衔接紧凑，可减少折返。' if transfer_2 == 20 else '晚间景点建议根据体力决定是否保留。'
         meal_hotel_notes = _build_meal_and_hotel_notes(destination, morning_poi, afternoon_poi, evening_poi, hotel_candidates, food_candidates, day - 1)
-        day_attractions = [item for item in (morning_poi, afternoon_poi, evening_poi) if item]
+        stage_score_context = {**route_context, **day_context, 'stage': stage, 'weather_day': weather_day}
+        day_attractions = []
+        for poi in (morning_poi, afternoon_poi, evening_poi):
+            if not poi:
+                continue
+            rescored = dict(poi)
+            if rescored.get('name') in must_visit_names:
+                rescored['must_visit'] = 'true'
+            score = score_poi(rescored, profile, stage_score_context)
+            rescored['reason'] = str(score['reason'])
+            rescored['tags'] = '、'.join(str(tag) for tag in score.get('tags', [])) if isinstance(score.get('tags'), list) else str(rescored.get('tags') or '')
+            day_attractions.append(rescored)
         day_reasons = [str(item.get('reason')) for item in day_attractions if item.get('reason')]
         day_tags = _dedupe_text([tag for item in day_attractions for tag in str(item.get('tags') or '').split('、') if tag])
+        required_today = [str(item.get('name')) for item in day_attractions if str(item.get('must_visit')).lower() == 'true']
         meal_notes = [note for note in meal_hotel_notes if note.startswith(('午餐', '晚餐'))]
         hotel_note = next((note for note in meal_hotel_notes if note.startswith('住宿')), None)
-        title = f'第{day}天：{destination}景点游览规划'
+        if stage == 'route':
+            title = f'第{day}天：{request.origin}到{destination}沿途第{stage_day}段'
+            stage_note = '沿途阶段：以顺路停留、控制驾驶疲劳和当晚住宿衔接为主。'
+            route_segment = f'{request.origin} → {destination} 沿途第{stage_day}段'
+        elif stage == 'buffer':
+            title = f'第{day}天：机动/返程缓冲'
+            stage_note = '机动缓冲：用于返程、补漏预约制景点或根据天气调整行程。'
+            route_segment = f'{destination}机动/返程缓冲'
+            recommended_spots = min(recommended_spots, 1)
+        else:
+            title = f'第{day}天：{destination}目的地深度游第{stage_day}天'
+            stage_note = '目的地阶段：以市内或周边景点深度游、餐饮住宿就近衔接为主。'
+            route_segment = f'{destination}市内/周边深度游第{stage_day}天'
 
-        if request.travel_mode == 'driving' and drive_today >= 180 and day < days:
+        if stage == 'route' and request.travel_mode == 'driving' and drive_today >= 180:
             drive_start_hour, drive_start_minute = 8, 0
             drive_end_hour, drive_end_minute = _shift_minutes(drive_start_hour, drive_start_minute, drive_today)
             morning_end_hour, morning_end_minute = _shift_minutes(drive_end_hour, drive_end_minute, morning_duration)
@@ -1443,15 +1681,37 @@ def _build_trip_itinerary(
                 f'傍晚安排 {evening_name}{f"（{evening_addr}）" if evening_addr else ""}，建议停留 {_format_duration_minutes(min(evening_duration, 120))}；'
                 f'{evening_note}。{move_2_text}'
             )
+        if stage == 'destination':
+            morning = morning.replace('上午主攻', f'目的地第{stage_day}天上午主攻')
+            afternoon = afternoon.replace('下午转场至', '下午在目的地内转场至')
+            evening = evening.replace('傍晚安排', '晚间就近安排')
+            if weather_day and weather_day.get('indoor_priority'):
+                morning = morning.replace('目的地第', '雨天/高温适配：目的地第')
+                afternoon = afternoon.replace('下午在目的地内转场至', '下午优先转场至室内或遮蔽条件较好的')
+            elif weather_day and weather_day.get('outdoor_suitability') == 'good':
+                morning = morning.replace('目的地第', '天气适合室外：目的地第')
+        elif stage == 'buffer':
+            morning = f'09:30-11:30 保留机动时间，可补充 {morning_name} 或处理返程/换乘安排。'
+            afternoon = '下午根据天气、体力和返程时间自由调整，不再强行增加远距离景点。'
+            evening = '晚间以就近用餐、整理行李和休息为主。'
+        weather_strategy = str((weather_day or {}).get('strategy') or ('天气为兜底参考，请以出行前实时天气为准。' if weather_context.get('data_source') == 'fallback' else '按实时天气调整室内外景点顺序。'))
+        weather_label = ''
+        if weather_day:
+            weather_label = f"当天天气：{weather_day.get('city', destination)} {weather_day.get('weather', '天气待确认')}，{weather_day.get('temperature', '温度待确认')}。"
         notes = [
+            stage_note,
             pace_note,
             f'天气参考：{weather_hint}',
-            f'天气策略：{"优先室内景点，室外项目压缩到早晚" if any(keyword in weather_hint for keyword in ("雨", "阵雨", "雷")) else "中午避开户外暴晒，室外景点尽量安排在上午或傍晚" if any(keyword in weather_hint for keyword in ("高温", "暴晒")) else "天气相对平稳，可按常规经典顺序游览"}。',
+            weather_label,
+            f'天气策略：{weather_strategy}',
             f'当日景点建议停留总时长约 {_format_duration_minutes(morning_duration + afternoon_duration + min(evening_duration, 120))}。',
             f'景点转场参考：上午到下午约预留 {transfer_1} 分钟，下午到傍晚约预留 {transfer_2} 分钟。',
             f'交通骨架参考：整体通行约{best_option.duration}，距离约{best_option.distance}。',
+            f'当天包含用户指定途经点/必去景点：{"、".join(required_today)}。' if required_today else '',
+            *stage_notes,
             *meal_hotel_notes,
         ]
+        notes = [note for note in notes if note]
         for used_name in (morning_name, afternoon_name, evening_name):
             if used_name:
                 used_attractions.add(used_name)
@@ -1459,7 +1719,8 @@ def _build_trip_itinerary(
             TripDayPlan(
                 day=day,
                 title=title,
-                route_segment=f'{request.origin} → {destination}' if day == 1 else f'{destination}第{day}天市内/沿途段',
+                stage=stage,
+                route_segment=route_segment,
                 drive_time=_format_duration_minutes(drive_today),
                 visit_time=_format_duration_minutes(available_visit_minutes),
                 morning=morning,
@@ -1470,8 +1731,9 @@ def _build_trip_itinerary(
                         'name': item.get('name', ''),
                         'address': item.get('address', ''),
                         'category': item.get('category', ''),
-                        'reason': item.get('reason', ''),
+                        'reason': item.get('reason', '') or ('用户指定必去，已纳入当日行程。' if str(item.get('must_visit')).lower() == 'true' else ''),
                         'tags': item.get('tags', ''),
+                        'must_visit': 'true' if str(item.get('must_visit')).lower() == 'true' else 'false',
                     }
                     for item in day_attractions[:recommended_spots]
                 ],
@@ -1539,18 +1801,44 @@ def build_travel_plan(request: TravelPlanRequest) -> TravelPlanResponse:
             user_preferences.append(pref)
     memory_store.update_profile(conversation_id, {'travel_preferences': user_preferences})
     profile = _extract_trip_profile(request)
-    route_options, data_source, route_error, location_debug = _fetch_tencent_route_options(request, scenario)
+    route_options, data_source, route_error, location_debug = fetch_route_options(request, profile)
     best_option = _choose_best_option(route_options, request)
-    route_context = _build_route_context(request, best_option, profile, location_debug, data_source)
+    route_context = build_route_context(request, profile, route_options, data_source, location_debug)
+    stage_counts = route_context.get('stage_counts') if isinstance(route_context.get('stage_counts'), dict) else {}
+    if stage_counts:
+        profile['duration_days'] = int(stage_counts.get('total_days') or profile.get('duration_days') or 1)
+        profile['route_days'] = int(stage_counts.get('route_days') or 0)
+        profile['destination_days'] = int(stage_counts.get('destination_days') or 0)
+        profile['buffer_days'] = int(stage_counts.get('buffer_days') or 0)
+        profile['stage_plan_mode'] = stage_counts.get('stage_plan_mode') or profile.get('stage_plan_mode')
+        profile['stage_notes'] = stage_counts.get('stage_notes', [])
     profile['trip_type'] = decide_trip_type({**profile, 'origin': request.origin, 'destination': request.destination, 'travel_mode': request.travel_mode, 'source_text': request.source_query or request.preferences or ''}, route_context)
     route_issues = _validate_route_reasonableness(best_option, request)
     route_issues.extend(str(item) for item in route_context.get('warnings', []))
     destination_point = location_debug.get('destination_point')
     origin_point = location_debug.get('origin_point')
     weather_hint = _fetch_weather_hint(request.destination, destination_point)
+    poi_candidates = fetch_poi_candidates(request, profile, route_context, location_debug)
+    weather_context = build_weather_context(
+        request.destination,
+        route_stops=poi_candidates.get('route_stops', []),
+        days=int(profile.get('duration_days') or 3),
+        location_debug=location_debug,
+    )
+    route_context['weather_context'] = weather_context
+    weather_hint = str(weather_context.get('summary') or weather_hint)
+    ranked_pois = rank_poi_candidates(poi_candidates, profile, route_context)
+    route_stop_names = [str(item.get('name')) for item in poi_candidates.get('route_stops', []) if item.get('name')]
+    ranked_route_names = [str(item.get('name')) for item in ranked_pois.get('route_candidates', [])[:6] if item.get('name')]
+    ranked_destination_names = [str(item.get('name')) for item in ranked_pois.get('destination_candidates', [])[:8] if item.get('name')]
     attraction_recommendations = _fetch_along_route_attractions(origin_point, destination_point, _infer_region_from_text(request.destination) or request.destination)
+    attraction_recommendations = _dedupe_text([*ranked_route_names, *ranked_destination_names, *attraction_recommendations, *route_stop_names])
     hotel_candidates = _search_hotels_for_city(request.destination, destination_point)
     food_candidates = _search_foods_for_location(request.destination, destination_point)
+    if not hotel_candidates:
+        hotel_candidates = poi_candidates.get('hotel_candidates', [])
+    if not food_candidates:
+        food_candidates = poi_candidates.get('food_candidates', [])
     quality_note = '; '.join(route_issues) if route_issues else None
     summary = _build_summary(
         request,
@@ -1573,6 +1861,11 @@ def build_travel_plan(request: TravelPlanRequest) -> TravelPlanResponse:
         food_candidates,
     )
     daily_itinerary = _build_trip_itinerary(request, profile, best_option, attraction_recommendations, weather_hint, route_context, hotel_candidates, food_candidates)
+    scheduled_names = {str(item.get('name')) for day in daily_itinerary for item in day.attractions if item.get('name')}
+    must_visit_attractions = [str(item) for item in profile.get('must_visit_attractions') or [] if str(item).strip()]
+    unscheduled_waypoints = [name for name in must_visit_attractions if name not in scheduled_names]
+    if unscheduled_waypoints:
+        travel_tips.append(f'以下用户指定地点未能放入每日主行程，建议作为备选或延长停留：{"、".join(unscheduled_waypoints)}。')
     short_term = memory_context.get('short_term', []) if isinstance(memory_context, dict) else []
     history = [
         ConversationTurn(user_input=str(item.get('user_input') or ''), assistant_output=str(item.get('assistant_output') or ''))
@@ -1626,10 +1919,23 @@ def build_travel_plan(request: TravelPlanRequest) -> TravelPlanResponse:
                 'interest_tags': profile.get('interest_tags', []),
                 'avoid_tags': profile.get('avoid_tags', []),
                 'pace': profile.get('pace'),
+                'route_days': profile.get('route_days'),
+                'destination_days': profile.get('destination_days'),
+                'buffer_days': profile.get('buffer_days'),
+                'stage_plan_mode': profile.get('stage_plan_mode'),
+                'stage_notes': profile.get('stage_notes', []),
             },
             'location_debug': location_debug,
+            'route_stops': poi_candidates.get('route_stops', []),
+            'poi_candidates': poi_candidates,
+            'ranked_pois': ranked_pois,
+            'waypoint_details': profile.get('waypoint_details', []),
+            'must_visit_attractions': must_visit_attractions,
+            'waypoint_order_mode': profile.get('waypoint_order_mode', 'unspecified'),
+            'unscheduled_waypoints': unscheduled_waypoints,
             'trip_profile': profile,
             'route_context': route_context,
+            'weather_context': weather_context,
             'weather_hint': weather_hint,
             'attractions': attraction_recommendations,
             'hotel_candidates': hotel_candidates,

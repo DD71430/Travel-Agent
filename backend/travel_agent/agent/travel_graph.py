@@ -12,8 +12,16 @@ from travel_agent.services.intent_service import classify_chat_intent
 from travel_agent.services.llm_chat_service import build_general_response, generate_general_answer
 from travel_agent.services.nearby_service import build_nearby_response
 from travel_agent.services.request_builder import build_travel_request
-from travel_agent.services.travel_planner import build_travel_plan
+from travel_agent.services.travel_planner import (
+    build_daily_itinerary,
+    build_route_context as planner_build_route_context,
+    build_travel_plan,
+    fetch_poi_candidates as planner_fetch_poi_candidates,
+    fetch_route_options as planner_fetch_route_options,
+    rank_poi_candidates as planner_rank_poi_candidates,
+)
 from travel_agent.services.trip_profile_service import build_trip_profile, decide_trip_type
+from travel_agent.services.weather_service import build_weather_context
 
 settings = get_settings()
 
@@ -36,6 +44,14 @@ class UnifiedAgentState(TypedDict, total=False):
     route_summary: str
     trip_profile: dict[str, Any]
     route_context: dict[str, Any]
+    route_options: list[Any]
+    data_source: str
+    route_error: str | None
+    location_debug: dict[str, Any]
+    poi_candidates: dict[str, Any]
+    ranked_pois: dict[str, Any]
+    daily_itinerary: list[Any]
+    weather_context: dict[str, Any]
 
 
 def _meta_with_notes(meta: dict[str, Any] | None, notes: list[str]) -> dict[str, Any]:
@@ -74,14 +90,16 @@ def _extract_trip_profile_node(state: UnifiedAgentState) -> UnifiedAgentState:
     return {**state, 'trip_profile': profile, 'processing_notes': notes}
 
 
-def _build_route_context_node(state: UnifiedAgentState) -> UnifiedAgentState:
-    profile = state.get('trip_profile', {})
-    route_context = {
-        'travel_mode': state['travel_request'].travel_mode,
-        'duration_days': profile.get('duration_days'),
-        'stage': 'route_context_deferred_to_travel_planner',
-    }
-    notes = [*state.get('processing_notes', []), 'route_context_prepared']
+async def _build_route_context_node(state: UnifiedAgentState) -> UnifiedAgentState:
+    route_context = await asyncio.to_thread(
+        planner_build_route_context,
+        state['travel_request'],
+        state.get('trip_profile', {}),
+        state.get('route_options', []),
+        state.get('data_source', 'fallback'),
+        state.get('location_debug', {}),
+    )
+    notes = [*state.get('processing_notes', []), 'route_context_built']
     return {**state, 'route_context': route_context, 'processing_notes': notes}
 
 
@@ -93,24 +111,57 @@ def _decide_trip_type_node(state: UnifiedAgentState) -> UnifiedAgentState:
     return {**state, 'trip_profile': profile, 'processing_notes': notes}
 
 
-def _fetch_route_options_node(state: UnifiedAgentState) -> UnifiedAgentState:
-    notes = [*state.get('processing_notes', []), 'route_options_fetch_deferred']
-    return {**state, 'processing_notes': notes}
+async def _fetch_route_options_node(state: UnifiedAgentState) -> UnifiedAgentState:
+    route_options, data_source, route_error, location_debug = await asyncio.to_thread(planner_fetch_route_options, state['travel_request'], state.get('trip_profile', {}))
+    notes = [*state.get('processing_notes', []), 'route_options_fetched']
+    return {**state, 'route_options': route_options, 'data_source': data_source, 'route_error': route_error, 'location_debug': location_debug, 'processing_notes': notes}
 
 
-def _fetch_poi_candidates_node(state: UnifiedAgentState) -> UnifiedAgentState:
-    notes = [*state.get('processing_notes', []), 'poi_candidates_fetch_deferred']
-    return {**state, 'processing_notes': notes}
+async def _fetch_poi_candidates_node(state: UnifiedAgentState) -> UnifiedAgentState:
+    poi_candidates = await asyncio.to_thread(
+        planner_fetch_poi_candidates,
+        state['travel_request'],
+        state.get('trip_profile', {}),
+        state.get('route_context', {}),
+        state.get('location_debug', {}),
+    )
+    notes = [*state.get('processing_notes', []), 'poi_candidates_fetched']
+    return {**state, 'poi_candidates': poi_candidates, 'processing_notes': notes}
 
 
-def _rank_poi_candidates_node(state: UnifiedAgentState) -> UnifiedAgentState:
-    notes = [*state.get('processing_notes', []), 'poi_ranking_deferred']
-    return {**state, 'processing_notes': notes}
+async def _fetch_weather_context_node(state: UnifiedAgentState) -> UnifiedAgentState:
+    weather_context = await asyncio.to_thread(
+        build_weather_context,
+        state['travel_request'].destination,
+        state.get('poi_candidates', {}).get('route_stops', []),
+        int(state.get('trip_profile', {}).get('duration_days') or 3),
+        state.get('location_debug', {}),
+    )
+    route_context = {**state.get('route_context', {}), 'weather_context': weather_context}
+    notes = [*state.get('processing_notes', []), 'weather_context_fetched']
+    return {**state, 'weather_context': weather_context, 'route_context': route_context, 'processing_notes': notes}
 
 
-def _build_daily_itinerary_node(state: UnifiedAgentState) -> UnifiedAgentState:
-    notes = [*state.get('processing_notes', []), 'daily_itinerary_deferred']
-    return {**state, 'processing_notes': notes}
+async def _rank_poi_candidates_node(state: UnifiedAgentState) -> UnifiedAgentState:
+    ranked_pois = await asyncio.to_thread(planner_rank_poi_candidates, state.get('poi_candidates', {}), state.get('trip_profile', {}), state.get('route_context', {}))
+    notes = [*state.get('processing_notes', []), 'poi_candidates_ranked']
+    return {**state, 'ranked_pois': ranked_pois, 'processing_notes': notes}
+
+
+async def _build_daily_itinerary_node(state: UnifiedAgentState) -> UnifiedAgentState:
+    daily_itinerary = await asyncio.to_thread(
+        build_daily_itinerary,
+        state['travel_request'],
+        state.get('trip_profile', {}),
+        state.get('route_context', {}),
+        state.get('ranked_pois', {}),
+        state.get('route_options', []),
+        state.get('weather_context', {}).get('summary'),
+        state.get('poi_candidates', {}).get('hotel_candidates', []),
+        state.get('poi_candidates', {}).get('food_candidates', []),
+    )
+    notes = [*state.get('processing_notes', []), 'daily_itinerary_built']
+    return {**state, 'daily_itinerary': daily_itinerary, 'processing_notes': notes}
 
 
 async def _finalize_travel_response(state: UnifiedAgentState) -> UnifiedAgentState:
@@ -186,6 +237,7 @@ def build_unified_graph():
     graph.add_node('decide_trip_type', _decide_trip_type_node)
     graph.add_node('fetch_route_options', _fetch_route_options_node)
     graph.add_node('fetch_poi_candidates', _fetch_poi_candidates_node)
+    graph.add_node('fetch_weather_context', _fetch_weather_context_node)
     graph.add_node('rank_poi_candidates', _rank_poi_candidates_node)
     graph.add_node('build_daily_itinerary', _build_daily_itinerary_node)
     graph.add_node('finalize_response', _finalize_travel_response)
@@ -196,11 +248,12 @@ def build_unified_graph():
     graph.add_edge('ensure_request', 'classify')
     graph.add_conditional_edges('classify', _after_classify, {'travel_planning': 'prepare_travel_request', 'nearby_search': 'build_nearby', 'general_chat': 'build_general'})
     graph.add_edge('prepare_travel_request', 'extract_trip_profile')
-    graph.add_edge('extract_trip_profile', 'build_route_context')
+    graph.add_edge('extract_trip_profile', 'fetch_route_options')
+    graph.add_edge('fetch_route_options', 'build_route_context')
     graph.add_edge('build_route_context', 'decide_trip_type')
-    graph.add_edge('decide_trip_type', 'fetch_route_options')
-    graph.add_edge('fetch_route_options', 'fetch_poi_candidates')
-    graph.add_edge('fetch_poi_candidates', 'rank_poi_candidates')
+    graph.add_edge('decide_trip_type', 'fetch_poi_candidates')
+    graph.add_edge('fetch_poi_candidates', 'fetch_weather_context')
+    graph.add_edge('fetch_weather_context', 'rank_poi_candidates')
     graph.add_edge('rank_poi_candidates', 'build_daily_itinerary')
     graph.add_edge('build_daily_itinerary', 'finalize_response')
     graph.add_conditional_edges('finalize_response', _after_travel_reflect, {'repair_travel': 'repair_travel', 'end': END})

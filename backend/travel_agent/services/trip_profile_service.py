@@ -28,6 +28,27 @@ AVOID_TAG_RULES: dict[str, tuple[str, ...]] = {
     '少走路': ('少走路', '少步行', '不想走太多'),
 }
 
+_CHINESE_NUMERAL_MAP = {'零': 0, '一': 1, '二': 2, '两': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '十': 10}
+
+
+def parse_cn_number(text: str | None) -> int | None:
+    if text is None:
+        return None
+    cleaned = str(text).strip()
+    if not cleaned:
+        return None
+    if cleaned.isdigit():
+        return int(cleaned)
+    if cleaned in _CHINESE_NUMERAL_MAP:
+        return _CHINESE_NUMERAL_MAP[cleaned]
+    if cleaned.startswith('十') and len(cleaned) == 2:
+        return 10 + _CHINESE_NUMERAL_MAP.get(cleaned[1], 0)
+    if cleaned.endswith('十') and len(cleaned) == 2:
+        return _CHINESE_NUMERAL_MAP.get(cleaned[0], 0) * 10
+    if '十' in cleaned and len(cleaned) == 3:
+        return _CHINESE_NUMERAL_MAP.get(cleaned[0], 0) * 10 + _CHINESE_NUMERAL_MAP.get(cleaned[2], 0)
+    return None
+
 
 def _dedupe(items: list[str]) -> list[str]:
     result: list[str] = []
@@ -64,6 +85,80 @@ def extract_pace(text: str | None) -> Literal['relaxed', 'normal', 'intensive']:
     return 'normal'
 
 
+def _first_number_for_patterns(source: str, patterns: tuple[str, ...]) -> int | None:
+    for pattern in patterns:
+        match = re.search(pattern, source)
+        if match:
+            parsed = parse_cn_number(match.group('num'))
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _parse_explicit_total_days(source: str) -> int | None:
+    return _first_number_for_patterns(
+        source,
+        (
+            r'(?:总共|一共|共|总计|全程|整体|总行程|总时长)\s*(?P<num>\d+|[一二两三四五六七八九十]+)\s*天',
+            r'(?P<num>\d+|[一二两三四五六七八九十]+)\s*天(?:总共|一共|全程|总行程)',
+        ),
+    )
+
+
+def parse_stage_days(text: str | None) -> dict[str, int | None | str]:
+    source = text or ''
+    route_no_play = bool(re.search(r'(中途|路上|沿途|途中)(?:不|不用|不要|不安排)(?:玩|游玩|景点|停留)', source))
+    destination_no_play = bool(re.search(r'(目的地|到达后|到了[^，。；,]*|到[^，。；,]{1,12})(?:不|不用|不要)(?:玩|游玩|停留)|到了就返程', source))
+    route_days = 0 if route_no_play else _first_number_for_patterns(
+        source,
+        (
+            r'(?:途中|路上|沿途|中途)(?:边走边玩|游玩|玩|安排|慢慢玩)?(?P<num>\d+|[一二两三四五六七八九十]+)\s*天',
+            r'(?:途中|路上|沿途|中途).*?(?P<num>\d+|[一二两三四五六七八九十]+)\s*天',
+        ),
+    )
+    destination_days = 0 if destination_no_play else _first_number_for_patterns(
+        source,
+        (
+            r'(?:目的地|到目的地|目的地深度游)(?:游玩|玩|安排|深度游)?(?P<num>\d+|[一二两三四五六七八九十]+)\s*天',
+            r'(?:到了|到|在)(?:目的地|[^，。；,\s]{1,12})(?:后|再)?(?:游玩|玩|安排|深度游)?(?P<num>\d+|[一二两三四五六七八九十]+)\s*天',
+        ),
+    )
+    route_nights = _first_number_for_patterns(
+        source,
+        (
+            r'(?:路上|途中|沿途)(?:只)?(?:住|住宿)(?P<num>\d+|[一二两三四五六七八九十]+)\s*晚',
+            r'(?:路上|途中|沿途).*?(?P<num>\d+|[一二两三四五六七八九十]+)\s*晚',
+        ),
+    )
+    destination_nights = _first_number_for_patterns(
+        source,
+        (
+            r'(?:目的地|到目的地|到了[^，。；,]*|到[^，。；,]{1,12})(?:住|住宿)(?P<num>\d+|[一二两三四五六七八九十]+)\s*晚',
+            r'(?:目的地|到目的地|到了[^，。；,]*|到[^，。；,]{1,12}).*?(?P<num>\d+|[一二两三四五六七八九十]+)\s*晚',
+        ),
+    )
+    if route_days is not None and destination_days is not None:
+        stage_plan_mode = 'route_then_destination' if route_days > 0 and destination_days > 0 else 'destination_only' if route_days == 0 else 'route_only'
+        total_days_source = 'stage_sum'
+    elif route_days is not None:
+        stage_plan_mode = 'route_only' if route_days > 0 else 'destination_only'
+        total_days_source = 'stage_sum' if route_days == 0 else 'inferred'
+    elif destination_days is not None:
+        stage_plan_mode = 'destination_only' if destination_days > 0 else 'route_only'
+        total_days_source = 'stage_sum' if destination_days == 0 else 'inferred'
+    else:
+        stage_plan_mode = 'mixed_unspecified'
+        total_days_source = 'inferred'
+    return {
+        'route_days': route_days,
+        'destination_days': destination_days,
+        'route_nights': route_nights,
+        'destination_nights': destination_nights,
+        'total_days_source': total_days_source,
+        'stage_plan_mode': stage_plan_mode,
+    }
+
+
 def _looks_cross_city(origin: str | None, destination: str | None) -> bool:
     if not origin or not destination:
         return False
@@ -77,8 +172,26 @@ def build_trip_profile_from_text(text: str | None, *, origin: str | None = None,
     parsed_origin, parsed_destination = extract_locations(source)
     trip_details = extract_trip_details(source)
     mode = extract_travel_mode(source, travel_mode)
+    explicit_total_days = _parse_explicit_total_days(source)
     duration_days = int(trip_details['duration_days']) if trip_details.get('duration_days') else None
     nights = int(trip_details['nights']) if trip_details.get('nights') else None
+    stage_days = parse_stage_days(source)
+    route_days = stage_days.get('route_days')
+    destination_days = stage_days.get('destination_days')
+    if isinstance(route_days, int) and isinstance(destination_days, int):
+        stage_sum = route_days + destination_days
+        if explicit_total_days is not None and explicit_total_days > stage_sum:
+            duration_days = explicit_total_days
+            total_days_source = 'explicit_total'
+        else:
+            duration_days = stage_sum
+            total_days_source = 'stage_sum'
+    else:
+        total_days_source = 'explicit_total' if duration_days is not None else str(stage_days.get('total_days_source') or 'inferred')
+        if duration_days is None and isinstance(route_days, int):
+            duration_days = route_days
+        if duration_days is None and isinstance(destination_days, int):
+            duration_days = destination_days
     if duration_days is None and nights is not None:
         duration_days = nights + 1
     if duration_days is None:
@@ -113,6 +226,13 @@ def build_trip_profile_from_text(text: str | None, *, origin: str | None = None,
         'avoid_tags': avoid_tags,
         'pace': pace,
         'trip_type': trip_type,
+        'route_days': route_days,
+        'destination_days': destination_days,
+        'route_nights': stage_days.get('route_nights'),
+        'destination_nights': stage_days.get('destination_nights'),
+        'total_days_source': total_days_source,
+        'stage_plan_mode': stage_days.get('stage_plan_mode'),
+        'explicit_total_days': explicit_total_days,
     }
 
 
@@ -126,6 +246,8 @@ def build_trip_profile(request: TravelPlanRequest) -> dict[str, Any]:
     base.setdefault('avoid_tags', profile['avoid_tags'])
     base.setdefault('pace', profile['pace'])
     base.setdefault('trip_type', profile['trip_type'])
+    for key in ('route_days', 'destination_days', 'route_nights', 'destination_nights', 'total_days_source', 'stage_plan_mode'):
+        base.setdefault(key, profile.get(key))
     return base
 
 
@@ -157,6 +279,10 @@ def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
     return any(keyword in text for keyword in keywords)
 
 
+_INDOOR_POI_KEYWORDS = ('博物馆', '美术馆', '纪念馆', '科技馆', '展览馆', '非遗馆', '室内', '体验馆', '商场')
+_OUTDOOR_POI_KEYWORDS = ('公园', '湿地', '湖', '山', '步道', '古城墙', '广场', '森林', '自然风光', '峡谷', '登山', '徒步')
+
+
 def score_poi(poi: dict[str, Any], trip_profile: dict[str, Any], route_context: dict[str, Any] | None = None) -> dict[str, float | str | list[str]]:
     name = str(poi.get('name') or poi.get('title') or '')
     category = str(poi.get('category') or '')
@@ -166,6 +292,7 @@ def score_poi(poi: dict[str, Any], trip_profile: dict[str, Any], route_context: 
     avoid_tags = set(trip_profile.get('avoid_tags') or [])
     pace = str(trip_profile.get('pace') or 'normal')
     reasons: list[str] = []
+    stage = str((route_context or {}).get('stage') or '')
     base_score = 20.0
     if _contains_any(combined, ('景区', '博物馆', '公园', '古城', '遗址', '纪念馆', '美术馆', '科技馆', '湿地', '乐园')):
         base_score += 15
@@ -188,7 +315,7 @@ def score_poi(poi: dict[str, Any], trip_profile: dict[str, Any], route_context: 
             reasons.append(f'{tag}偏好')
     route_score = 10.0
     if route_context and poi.get('route_order') is not None:
-        route_score += 10
+        route_score += 16 if stage == 'route' else 10
         reasons.append('顺路')
     time_fit_score = 10.0
     estimated_minutes = int(poi.get('estimated_minutes') or 120)
@@ -197,6 +324,12 @@ def score_poi(poi: dict[str, Any], trip_profile: dict[str, Any], route_context: 
         time_fit_score += 10
     elif estimated_minutes > available_minutes + 60:
         time_fit_score -= 8
+    if stage == 'route' and estimated_minutes <= 120:
+        time_fit_score += 8
+        reasons.append('适合短暂停留')
+    if stage == 'destination' and preference_score > 0:
+        preference_score += 8
+        reasons.append('目的地深度游')
     crowd_fit_score = 0.0
     if '亲子' in interest_tags and _contains_any(combined, ('科技馆', '动物园', '乐园', '海洋馆', '体验馆')):
         crowd_fit_score += 16
@@ -212,17 +345,51 @@ def score_poi(poi: dict[str, Any], trip_profile: dict[str, Any], route_context: 
         avoid_penalty += 20
     if ('不太累' in avoid_tags or '少走路' in avoid_tags) and _contains_any(combined, ('山', '徒步', '步道', '长城')):
         avoid_penalty += 18
-    final_score = base_score + preference_score * 2.0 + route_score * 1.5 + time_fit_score * 1.2 + crowd_fit_score - avoid_penalty * 2.0
+    must_visit_score = 0.0
+    must_visit = bool(poi.get('must_visit')) or str(poi.get('must_visit')).lower() == 'true'
+    if must_visit:
+        must_visit_score += 60
+        reasons.append('用户指定必去')
+        if stage == 'route':
+            reasons.append('途经点优先安排')
+    weather_score = 0.0
+    weather_day = (route_context or {}).get('weather_day') if isinstance(route_context, dict) else None
+    if isinstance(weather_day, dict):
+        indoor_priority = bool(weather_day.get('indoor_priority'))
+        outdoor_suitability = str(weather_day.get('outdoor_suitability') or '')
+        is_indoor = _contains_any(combined, _INDOOR_POI_KEYWORDS)
+        is_outdoor = _contains_any(combined, _OUTDOOR_POI_KEYWORDS)
+        if must_visit and is_outdoor and outdoor_suitability in {'poor', 'limited'}:
+            weather_score += 18
+            reasons.append('建议视天气调整时段或准备备选')
+        if indoor_priority and is_indoor:
+            weather_score += 22
+            reasons.append('天气适配：雨天优先室内')
+        if indoor_priority and is_outdoor:
+            weather_score -= 18 if outdoor_suitability != 'poor' else 32
+            reasons.append('天气适配：户外备选')
+        if outdoor_suitability == 'good' and is_outdoor:
+            weather_score += 12
+            reasons.append('天气适合室外游览')
+        if outdoor_suitability == 'poor' and is_outdoor:
+            weather_score -= 16
+            reasons.append('恶劣天气不建议户外')
+    route_weight = 2.0 if stage == 'route' else 1.5
+    preference_weight = 2.4 if stage == 'destination' else 2.0
+    final_score = base_score + preference_score * preference_weight + route_score * route_weight + time_fit_score * 1.2 + crowd_fit_score + weather_score + must_visit_score - avoid_penalty * 2.0
     if not reasons:
         reasons.append('综合匹配')
+    reason_prefix = '沿途阶段推荐' if stage == 'route' else '目的地深度游推荐' if stage == 'destination' else '优先推荐'
     return {
         'base_score': round(base_score, 2),
         'preference_score': round(preference_score, 2),
         'route_score': round(route_score, 2),
         'time_fit_score': round(time_fit_score, 2),
         'crowd_fit_score': round(crowd_fit_score, 2),
+        'weather_score': round(weather_score, 2),
+        'must_visit_score': round(must_visit_score, 2),
         'avoid_penalty': round(avoid_penalty, 2),
         'final_score': round(final_score, 2),
-        'reason': f'优先推荐：{"，".join(reasons[:3])}。',
+        'reason': f'{reason_prefix}：{"，".join(reasons[:4])}。',
         'tags': reasons[:4],
     }
