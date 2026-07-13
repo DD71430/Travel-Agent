@@ -68,9 +68,12 @@ class TripDayPlan(BaseModel):
     day: int
     title: str
     stage: Literal['route', 'destination', 'buffer'] | str = 'destination'
+    anchor_city: str | None = None
     route_segment: str | None = None
+    segment_data_source: str | None = None
     drive_time: str | None = None
     visit_time: str | None = None
+    weather_strategy: str | None = None
     morning: str
     afternoon: str
     evening: str

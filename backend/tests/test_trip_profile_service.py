@@ -44,6 +44,29 @@ def test_parse_route_and_destination_stage_days():
     assert '公园' in profile['interest_tags']
 
 
+def test_parse_stopover_day_and_destination_remainder():
+    question = '从济南自驾到杭州三天两晚，在徐州停留一天，剩余时间在杭州游玩，优先经典景点和合理游览节奏'
+
+    request = build_travel_request(ChatRequest(question=question))
+    profile = build_trip_profile(request)
+
+    assert request.origin == '济南'
+    assert request.destination == '杭州'
+    assert request.travel_mode == 'driving'
+    assert any(stop['name'] == '徐州' for stop in profile['route_stops'])
+    assert profile['route_days'] >= 1
+    assert profile['destination_days'] >= 1
+    assert profile['destination_stay_days'] == profile['destination_days']
+
+
+def test_parse_stage_sum_when_route_and_destination_days_are_explicit():
+    profile = build_trip_profile_from_text('从济南到成都，途中游玩三天，到成都游玩三天')
+
+    assert profile['route_days'] == 3
+    assert profile['destination_days'] == 3
+    assert profile['duration_days'] == 6
+
+
 def test_parse_destination_only_when_route_has_no_play():
     profile = build_trip_profile_from_text('从北京到西安，中途不玩，到西安玩三天')
     assert profile['route_days'] == 0

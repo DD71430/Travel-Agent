@@ -22,7 +22,7 @@ class RedisMemoryStore:
 
     def _create_client(self):
         try:
-            client = redis.from_url(settings.redis_url, decode_responses=True)
+            client = redis.from_url(settings.redis_url, decode_responses=True, socket_connect_timeout=0.2, socket_timeout=0.2)
             client.ping()
             return client
         except Exception:

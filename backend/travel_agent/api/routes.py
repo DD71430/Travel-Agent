@@ -12,5 +12,5 @@ router.include_router(chat_router)
 def plan_travel(request: TravelPlanRequest) -> TravelPlanResponse:
     try:
         return build_travel_plan(request)
-    except TencentMapsError as exc:
+    except TencentMapsError:
         raise

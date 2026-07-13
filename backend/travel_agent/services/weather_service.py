@@ -85,16 +85,17 @@ def _fallback_daily_weather(destination: str, route_stops: list[dict[str, Any]] 
     daily: list[dict[str, Any]] = []
     for index in range(1, max(1, days) + 1):
         city = _safe_city(cities[index - 1] if index - 1 < len(cities) else destination)
-        suitability = classify_weather_suitability('天气待确认', '18-28℃')
         daily.append(
             {
                 'day': index,
                 'city': city,
                 'weather': '天气待确认',
-                'temperature': '18-28℃',
+                'temperature': '温度待确认',
                 'wind': '以实时预报为准',
-                **suitability,
-                'strategy': '天气为兜底参考，请以出行前实时天气为准；默认保留室内外备选。',
+                'risk_level': 'unknown',
+                'outdoor_suitability': 'unknown',
+                'indoor_priority': False,
+                'strategy': '天气待确认，建议出行前查看实时天气；本行程保留室内/室外备选。',
             }
         )
     return daily
@@ -155,7 +156,7 @@ def build_weather_context(destination: str, route_stops: list[dict[str, Any]] | 
     return {
         'data_source': 'fallback',
         'destination': destination,
-        'summary': f'{_safe_city(destination)}天气为兜底参考，请以出行前实时天气为准；行程已保留室内外备选。',
+        'summary': f'{_safe_city(destination)}天气待确认，建议出行前查看实时天气；本行程保留室内/室外备选。',
         'daily_weather': daily_weather,
         'warnings': ['weather_fallback'],
         'request_debug': {'provider': 'fallback', 'fallback_reason': 'missing_key_or_weather_unavailable'},

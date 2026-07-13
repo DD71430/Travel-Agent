@@ -57,7 +57,7 @@ async def generate_general_answer(question: str, conversation_id: str, memory_st
             )
             response.raise_for_status()
             result = response.json()
-    except Exception as exc:
+    except Exception:
         logger.exception('LLM chat request failed')
         return '模型服务请求失败，请稍后重试。'
     choices = result.get('choices') if isinstance(result, dict) else None

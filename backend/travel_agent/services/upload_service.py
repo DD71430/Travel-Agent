@@ -105,6 +105,7 @@ def extract_upload_context(upload: UploadFile | None, content: bytes | None) -> 
     audio_debug: dict = {}
     if content_type.startswith('image/'):
         file_kind = 'image'
+        extraction_error = 'image_content_not_parsed'
     elif suffix == '.pdf' or content_type == 'application/pdf':
         file_kind = 'pdf'
         try:
@@ -125,6 +126,8 @@ def extract_upload_context(upload: UploadFile | None, content: bytes | None) -> 
         if not extracted_text:
             extraction_error = audio_error or 'audio_transcribe_failed'
     upload_context = {'filename': filename, 'content_type': content_type, 'size': len(content), 'file_kind': file_kind, 'extracted_text': extracted_text, 'extraction_error': extraction_error}
+    if file_kind == 'image':
+        upload_context['notice'] = '已接收图片；当前版本暂未解析图片内容，可补充文字需求。'
     if audio_debug and settings.debug:
         upload_context['audio_debug'] = audio_debug
     return upload_context

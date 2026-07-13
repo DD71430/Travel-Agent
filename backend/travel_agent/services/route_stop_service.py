@@ -66,9 +66,12 @@ def infer_route_stops(
                     'name': name,
                     'type': waypoint_type if waypoint_type in {'city', 'attraction', 'poi', 'unknown'} else 'unknown',
                     'stage_day': int(stage_day),
+                    'stay_days': waypoint.get('stay_days', 0),
+                    'stay_nights': waypoint.get('stay_nights', 0),
+                    'preferred_day': waypoint.get('preferred_day') or stage_day,
                     'must_visit': must_visit,
-                    'reason': '用户明确要求沿途安排' if must_visit else f'用户明确指定途经{name}，优先作为沿途第{stage_day}天停留点。',
-                    'data_source': 'user_waypoint',
+                    'reason': waypoint.get('reason') or ('用户明确要求沿途安排' if must_visit else f'用户明确指定途经{name}，优先作为沿途第{stage_day}天停留点。'),
+                    'data_source': waypoint.get('source') or 'user_waypoint',
                 }
             )
         if len(stops) > route_days * 3:

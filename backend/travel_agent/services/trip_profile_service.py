@@ -9,6 +9,7 @@ from travel_agent.services.intent_service import extract_locations, extract_ques
 TripType = Literal['destination_trip', 'along_route_trip', 'commute', 'nearby_search', 'general_chat']
 
 INTEREST_TAG_RULES: dict[str, tuple[str, ...]] = {
+    '经典景点': ('经典景点', '经典', '地标', '必打卡'),
     '博物馆': ('博物馆', '纪念馆', '美术馆', '科技馆', '展览', '展馆'),
     '公园': ('公园', '湿地', '湖泊', '步道', '绿道'),
     '古城': ('古城', '古镇', '城墙', '古迹'),
@@ -95,6 +96,99 @@ def _first_number_for_patterns(source: str, patterns: tuple[str, ...]) -> int | 
     return None
 
 
+def _parse_stay_amount(num_text: str | None, unit_text: str | None = None) -> float | None:
+    raw = (num_text or unit_text or '').strip()
+    unit = (unit_text or '').strip()
+    if raw in {'半', '半天'} or unit == '半天':
+        return 0.5
+    parsed = parse_cn_number(num_text)
+    if parsed is not None:
+        return float(parsed)
+    if unit == '一晚':
+        return 1.0
+    return None
+
+
+def _add_route_stop(
+    stops: list[dict[str, Any]],
+    name: str,
+    *,
+    destination: str | None,
+    stop_type: str = 'city',
+    stay_days: float | None = None,
+    stay_nights: int | None = None,
+    preferred_day: int | None = None,
+    must_visit: bool = False,
+    source: str = 'parsed_stopover',
+) -> None:
+    cleaned = re.sub(r'(停留|游玩|玩|住|住宿|看看|参观).*$', '', name.strip(' ，。；;、'))
+    cleaned = re.sub(r'^(中途|途中|路上|沿途)?(?:在|到|去)', '', cleaned)
+    cleaned = re.sub(r'(半天|一晚|\d+\s*[天晚]|[一二两三四五六七八九十]+\s*[天晚]).*$', '', cleaned).strip(' ，。；;、')
+    if cleaned in {'中途', '途中', '路上', '沿途', '目的地', '剩余时间', '余下时间'}:
+        return
+    if not cleaned or len(cleaned) < 2:
+        return
+    destination_clean = (destination or '').replace('市', '').strip()
+    if destination_clean and cleaned.replace('市', '').strip() == destination_clean:
+        return
+    existing = next((item for item in stops if item['name'] == cleaned), None)
+    if existing:
+        if stay_days is not None:
+            existing['stay_days'] = max(float(existing.get('stay_days') or 0), stay_days)
+        if stay_nights is not None:
+            existing['stay_nights'] = max(int(existing.get('stay_nights') or 0), stay_nights)
+        existing['must_visit'] = bool(existing.get('must_visit') or must_visit)
+        if preferred_day and not existing.get('preferred_day'):
+            existing['preferred_day'] = preferred_day
+        return
+    stops.append(
+        {
+            'name': cleaned,
+            'type': stop_type,
+            'stay_days': stay_days if stay_days is not None else 0,
+            'stay_nights': stay_nights or 0,
+            'preferred_day': preferred_day,
+            'must_visit': must_visit,
+            'source': source,
+        }
+    )
+
+
+def parse_route_stops(text: str | None, *, destination: str | None = None) -> list[dict[str, Any]]:
+    source = text or ''
+    stops: list[dict[str, Any]] = []
+    stopover_patterns = (
+        r'(?:(?:中途|途中|路上|沿途)?在|途经|路过|经过)(?P<name>[^，。；,、和及]{2,12}?)(?P<action>停留|游玩|玩|住宿|住)(?P<num>半|\d+|[一二两三四五六七八九十]+)?\s*(?P<unit>半天|天|晚|一晚)?',
+        r'(?P<name>[^，。；,、和及]{2,12}?)(?P<action>停留|游玩|玩|住宿|住)(?P<num>半|\d+|[一二两三四五六七八九十]+)?\s*(?P<unit>半天|天|晚|一晚)',
+    )
+    for pattern in stopover_patterns:
+        for match in re.finditer(pattern, source):
+            name = match.group('name')
+            action = match.group('action') or ''
+            unit = match.group('unit') or ''
+            amount = _parse_stay_amount(match.group('num'), unit)
+            stay_days = amount if unit in {'天', '半天'} or action in {'停留', '游玩', '玩'} else None
+            stay_nights = int(amount or 1) if unit in {'晚', '一晚'} or action in {'住', '住宿'} else None
+            if stay_days is None and stay_nights is not None:
+                stay_days = float(max(1, stay_nights))
+            _add_route_stop(
+                stops,
+                name,
+                destination=destination,
+                stay_days=stay_days,
+                stay_nights=stay_nights,
+                source='parsed_stopover',
+            )
+    for match in re.finditer(r'第(?P<num>\d+|[一二两三四五六七八九十]+)\s*[天日](?:到|抵达|住在|住)(?P<name>[^，。；,、和及]{2,12})', source):
+        preferred_day = parse_cn_number(match.group('num'))
+        _add_route_stop(stops, match.group('name'), destination=destination, stay_days=1, preferred_day=preferred_day, source='parsed_day_instruction')
+    for item in extract_question_waypoints(source):
+        _add_route_stop(stops, str(item.get('name') or ''), destination=destination, source='parsed_waypoint')
+    for match in re.finditer(r'(?:沿途|途中|中途|路上)(?:必须|一定要|必去|必须去|一定要去)(?P<name>[^，。；,]+)', source):
+        _add_route_stop(stops, match.group('name'), destination=destination, stop_type='attraction', must_visit=True, source='parsed_must_visit')
+    return stops
+
+
 def _parse_explicit_total_days(source: str) -> int | None:
     return _first_number_for_patterns(
         source,
@@ -120,7 +214,8 @@ def parse_stage_days(text: str | None) -> dict[str, int | None | str]:
         source,
         (
             r'(?:目的地|到目的地|目的地深度游)(?:游玩|玩|安排|深度游)?(?P<num>\d+|[一二两三四五六七八九十]+)\s*天',
-            r'(?:到了|到|在)(?:目的地|[^，。；,\s]{1,12})(?:后|再)?(?:游玩|玩|安排|深度游)?(?P<num>\d+|[一二两三四五六七八九十]+)\s*天',
+            r'(?:到了|到|在)(?:目的地|[^，。；,\s]{1,12})(?:后|之后|后再|再)?(?:游玩|玩|安排|深度游|停留)(?P<num>\d+|[一二两三四五六七八九十]+)\s*天',
+            r'(?:到了|到)(?:目的地|[^，。；,\s]{1,12})(?:后|之后|后再|再)(?P<num>\d+|[一二两三四五六七八九十]+)\s*天',
         ),
     )
     route_nights = _first_number_for_patterns(
@@ -167,9 +262,46 @@ def _looks_cross_city(origin: str | None, destination: str | None) -> bool:
     return bool(origin_clean and destination_clean and origin_clean != destination_clean)
 
 
+def _ceil_positive_days(value: float | int | None) -> int:
+    try:
+        amount = float(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    if amount <= 0:
+        return 0
+    whole = int(amount)
+    return whole if amount == whole else whole + 1
+
+
+def _wants_destination_remainder(source: str, destination: str | None) -> bool:
+    destination_clean = (destination or '').replace('市', '').strip()
+    if any(keyword in source for keyword in ('剩余时间', '剩下时间', '余下时间', '其余时间', '剩余的时间')):
+        return True
+    if destination_clean:
+        return bool(re.search(rf'(?:到|在){re.escape(destination_clean)}(?:后|之后)?(?:游玩|玩|深度游|停留)', source))
+    return False
+
+
+def _route_days_from_stops(route_stops: list[dict[str, Any]], total_days: int | None, wants_destination_remainder: bool) -> int | None:
+    if not route_stops:
+        return None
+    full_stop_days = sum(max(1, _ceil_positive_days(stop.get('stay_days') or stop.get('stay_nights'))) for stop in route_stops if float(stop.get('stay_days') or 0) >= 1 or int(stop.get('stay_nights') or 0) >= 1)
+    if full_stop_days:
+        inferred = full_stop_days
+        if wants_destination_remainder and (total_days is None or total_days > inferred):
+            inferred += 1
+    else:
+        inferred = 1
+    if total_days is not None and total_days > 1:
+        return min(max(1, inferred), total_days)
+    return max(1, inferred)
+
+
 def build_trip_profile_from_text(text: str | None, *, origin: str | None = None, destination: str | None = None, travel_mode: str | None = None) -> dict[str, Any]:
     source = text or ''
     parsed_origin, parsed_destination = extract_locations(source)
+    merged_origin = origin or parsed_origin
+    merged_destination = destination or parsed_destination
     trip_details = extract_trip_details(source)
     mode = extract_travel_mode(source, travel_mode)
     explicit_total_days = _parse_explicit_total_days(source)
@@ -178,6 +310,15 @@ def build_trip_profile_from_text(text: str | None, *, origin: str | None = None,
     stage_days = parse_stage_days(source)
     route_days = stage_days.get('route_days')
     destination_days = stage_days.get('destination_days')
+    route_stops = parse_route_stops(source, destination=merged_destination)
+    wants_remainder = _wants_destination_remainder(source, merged_destination)
+    stop_route_days = _route_days_from_stops(route_stops, duration_days, wants_remainder)
+    if stop_route_days is not None:
+        route_days = max(int(route_days), stop_route_days) if isinstance(route_days, int) else stop_route_days
+    if wants_remainder and destination_days is None and duration_days is not None and isinstance(route_days, int):
+        if duration_days - route_days <= 0 and duration_days > 1:
+            route_days = duration_days - 1
+        destination_days = max(1, duration_days - int(route_days))
     if isinstance(route_days, int) and isinstance(destination_days, int):
         stage_sum = route_days + destination_days
         if explicit_total_days is not None and explicit_total_days > stage_sum:
@@ -196,8 +337,13 @@ def build_trip_profile_from_text(text: str | None, *, origin: str | None = None,
         duration_days = nights + 1
     if duration_days is None:
         duration_days = 2 if any(keyword in source for keyword in ('周末', '两天', '二天')) else 3
-    merged_origin = origin or parsed_origin
-    merged_destination = destination or parsed_destination
+    if wants_remainder and destination_days is None and isinstance(route_days, int):
+        if duration_days - route_days <= 0 and duration_days > 1:
+            route_days = duration_days - 1
+        destination_days = max(1, duration_days - int(route_days))
+    if isinstance(route_days, int) and destination_days is None and route_days < duration_days and wants_remainder:
+        destination_days = duration_days - route_days
+    buffer_days = max(0, int(duration_days or 0) - int(route_days or 0) - int(destination_days or 0))
     interest_tags = extract_interest_tags(source)
     avoid_tags = extract_avoid_tags(source)
     pace = extract_pace(source)
@@ -228,8 +374,11 @@ def build_trip_profile_from_text(text: str | None, *, origin: str | None = None,
         'trip_type': trip_type,
         'route_days': route_days,
         'destination_days': destination_days,
+        'buffer_days': buffer_days,
         'route_nights': stage_days.get('route_nights'),
         'destination_nights': stage_days.get('destination_nights'),
+        'route_stops': route_stops,
+        'destination_stay_days': destination_days,
         'total_days_source': total_days_source,
         'stage_plan_mode': stage_days.get('stage_plan_mode'),
         'explicit_total_days': explicit_total_days,
@@ -246,7 +395,7 @@ def build_trip_profile(request: TravelPlanRequest) -> dict[str, Any]:
     base.setdefault('avoid_tags', profile['avoid_tags'])
     base.setdefault('pace', profile['pace'])
     base.setdefault('trip_type', profile['trip_type'])
-    for key in ('route_days', 'destination_days', 'route_nights', 'destination_nights', 'total_days_source', 'stage_plan_mode'):
+    for key in ('route_days', 'destination_days', 'buffer_days', 'route_nights', 'destination_nights', 'route_stops', 'destination_stay_days', 'total_days_source', 'stage_plan_mode'):
         base.setdefault(key, profile.get(key))
     return base
 

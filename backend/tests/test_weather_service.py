@@ -39,3 +39,34 @@ def test_build_weather_context_fallback_without_key(monkeypatch):
     assert context['data_source'] == 'fallback'
     assert len(context['daily_weather']) == 3
     assert context['summary']
+
+
+def test_build_weather_context_uses_tencent_when_adcode_exists(monkeypatch):
+    from travel_agent.services import weather_service
+
+    monkeypatch.setattr(weather_service.settings, 'tencent_maps_key', 'fake-key')
+
+    def fake_weather_info(adcode):
+        assert adcode == '320100'
+        return {
+            'status': 0,
+            'result': {
+                'forecast': [
+                    {'weather': '阵雨', 'min_temperature': '22', 'max_temperature': '28', 'wind_direction': '东风'},
+                ]
+            },
+        }
+
+    monkeypatch.setattr(weather_service._client, 'weather_info', fake_weather_info)
+    context = build_weather_context('南京', days=1, location_debug={'destination_adcode': '320100'})
+    assert context['data_source'] == 'tencent_maps'
+    assert context['daily_weather'][0]['indoor_priority'] is True
+
+
+def test_build_weather_context_fallback_without_adcode(monkeypatch):
+    from travel_agent.services import weather_service
+
+    monkeypatch.setattr(weather_service.settings, 'tencent_maps_key', 'fake-key')
+    context = build_weather_context('南京', days=1, location_debug={})
+    assert context['data_source'] == 'fallback'
+    assert context['request_debug']['fallback_reason'] == 'missing_key_or_weather_unavailable'

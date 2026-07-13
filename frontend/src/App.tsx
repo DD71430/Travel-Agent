@@ -89,9 +89,12 @@ type TripDayPlan = {
   day: number
   title: string
   stage?: 'route' | 'destination' | 'buffer' | string
+  anchor_city?: string | null
   route_segment?: string
+  segment_data_source?: string | null
   drive_time?: string
   visit_time?: string
+  weather_strategy?: string | null
   morning: string
   afternoon: string
   evening: string
@@ -335,6 +338,26 @@ function getStageLabel(value?: string) {
   return '行程阶段'
 }
 
+function dedupeStrings(items?: string[]) {
+  const result: string[] = []
+  for (const item of items || []) {
+    const cleaned = item.trim()
+    if (cleaned && !result.includes(cleaned)) result.push(cleaned)
+  }
+  return result
+}
+
+function getDisplayNotes(day: TripDayPlan) {
+  const meals = new Set(dedupeStrings(day.meals))
+  const hotelHint = day.hotel_hint || ''
+  return dedupeStrings(day.notes).filter((note) => {
+    if (note.startsWith('午餐') || note.startsWith('晚餐') || note.startsWith('住宿')) return false
+    if (meals.has(note)) return false
+    if (hotelHint && note === hotelHint) return false
+    return true
+  })
+}
+
 function getProfileNumber(profile: Record<string, unknown> | null | undefined, key: string) {
   const value = profile?.[key]
   if (typeof value === 'number') return value
@@ -345,11 +368,17 @@ function getProfileNumber(profile: Record<string, unknown> | null | undefined, k
   return null
 }
 
-function getWeatherBadge(day?: WeatherDay) {
+function getWeatherBadge(day?: WeatherDay, isFallback = false) {
   if (!day) return '天气待确认'
+  if (isFallback) return '天气待确认'
   if (day.indoor_priority) return '室内优先'
   if (day.outdoor_suitability === 'good') return '室外适合'
   return '天气参考'
+}
+
+function formatWeatherDay(day: WeatherDay, isFallback: boolean) {
+  if (isFallback) return `${day.city || '目的地'} · 天气待确认`
+  return `${day.city || '目的地'} · ${day.weather || '天气待确认'} · ${day.temperature || '温度待确认'}`
 }
 
 function getWaypointOrderLabel(value?: string) {
@@ -396,7 +425,7 @@ function PlanCard({ plan }: { plan: TravelPlanResponse }) {
         <div className="fallback-banner">当前为兜底规划，真实路线、营业时间和票务信息请以出行前查询为准。</div>
       ) : null}
       {weatherContext?.data_source === 'fallback' ? (
-        <div className="weather-banner">天气为兜底参考，请以出行前实时天气为准。</div>
+        <div className="weather-banner">天气待确认，建议出行前查看实时天气；本行程保留室内/室外备选。</div>
       ) : null}
       {unscheduledWaypoints.length ? (
         <div className="fallback-banner">未安排途经点/景点：{unscheduledWaypoints.join('、')}。建议延长停留或作为备选。</div>
@@ -463,20 +492,21 @@ function PlanCard({ plan }: { plan: TravelPlanResponse }) {
           <article key={day.day} className="day-card">
             {(() => {
               const weatherDay = dailyWeather[day.day - 1]
+              const isFallbackWeather = weatherContext?.data_source === 'fallback'
               return weatherDay ? (
                 <div className="weather-chip-row">
-                  <span>{weatherDay.city || '目的地'} · {weatherDay.weather || '天气待确认'} · {weatherDay.temperature || '温度待确认'}</span>
-                  <strong>{getWeatherBadge(weatherDay)}</strong>
-                  {weatherDay.strategy ? <small>{weatherDay.strategy}</small> : null}
+                  <span>{formatWeatherDay(weatherDay, isFallbackWeather)}</span>
+                  <strong>{getWeatherBadge(weatherDay, isFallbackWeather)}</strong>
+                  <small>{isFallbackWeather ? '保留室内/室外备选' : weatherDay.strategy}</small>
                 </div>
               ) : null
             })()}
             <div className="day-card-head">
               <strong>第{day.day}天</strong>
-              <span>{day.title}</span>
+              <span>{day.title}{day.anchor_city ? ` · ${day.anchor_city}` : ''}</span>
               <em>{getStageLabel(day.stage)}</em>
             </div>
-            <p><b>路线段：</b>{day.route_segment || '按当日景点顺序串联'}；<b>行驶/转场：</b>{day.drive_time || '按实时路况'}；<b>可游玩：</b>{day.visit_time || '约半天至全天'}</p>
+            <p><b>路线段：</b>{day.route_segment || '按当日景点顺序串联'}；<b>当天城市：</b>{day.anchor_city || '按行程'}；<b>行驶/转场：</b>{day.drive_time || '按实时路况'}；<b>可游玩：</b>{day.visit_time || '约半天至全天'}</p>
             <p><b>上午：</b>{day.morning}</p>
             <p><b>下午：</b>{day.afternoon}</p>
             <p><b>晚上：</b>{day.evening}</p>
@@ -487,14 +517,14 @@ function PlanCard({ plan }: { plan: TravelPlanResponse }) {
             ) : null}
             {day.recommendation_reasons?.length ? (
               <ul>
-                {day.recommendation_reasons.slice(0, 3).map((reason) => <li key={reason}>{reason}</li>)}
+                {dedupeStrings(day.recommendation_reasons).slice(0, 3).map((reason) => <li key={reason}>{reason}</li>)}
               </ul>
             ) : null}
-            {day.meals?.length ? <p><b>餐饮：</b>{day.meals.join(' ')}</p> : null}
+            {day.meals?.length ? <p><b>餐饮：</b>{dedupeStrings(day.meals).join(' ')}</p> : null}
             {day.hotel_hint ? <p><b>住宿：</b>{day.hotel_hint}</p> : null}
-            {day.notes?.length ? (
+            {getDisplayNotes(day).length ? (
               <div className="note-row">
-                {day.notes.map((note) => <span key={note}>{note}</span>)}
+                {getDisplayNotes(day).map((note) => <span key={note}>{note}</span>)}
               </div>
             ) : null}
           </article>

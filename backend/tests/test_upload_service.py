@@ -15,3 +15,12 @@ def test_extract_markdown_upload():
     context = extract_upload_context(upload, b'# Title\n\nbody')
     assert context['file_kind'] == 'text'
     assert 'Title' in context['extracted_text']
+
+
+def test_image_upload_is_honest_without_content_recognition():
+    upload = SimpleNamespace(filename='photo.png', content_type='image/png')
+    context = extract_upload_context(upload, b'\x89PNG\r\n')
+    assert context['file_kind'] == 'image'
+    assert context['extracted_text'] == ''
+    assert context['extraction_error'] == 'image_content_not_parsed'
+    assert '暂未解析图片内容' in context['notice']

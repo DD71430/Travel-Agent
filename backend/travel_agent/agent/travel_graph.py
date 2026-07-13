@@ -15,7 +15,7 @@ from travel_agent.services.request_builder import build_travel_request
 from travel_agent.services.travel_planner import (
     build_daily_itinerary,
     build_route_context as planner_build_route_context,
-    build_travel_plan,
+    compose_travel_plan,
     fetch_poi_candidates as planner_fetch_poi_candidates,
     fetch_route_options as planner_fetch_route_options,
     rank_poi_candidates as planner_rank_poi_candidates,
@@ -168,7 +168,20 @@ async def _finalize_travel_response(state: UnifiedAgentState) -> UnifiedAgentSta
     travel_request = state['travel_request']
     if state.get('trip_profile'):
         travel_request = TravelPlanRequest(**{**travel_request.model_dump(), 'trip_profile': {**travel_request.trip_profile, **state['trip_profile']}})
-    travel_plan = await asyncio.to_thread(build_travel_plan, travel_request)
+    travel_plan = await asyncio.to_thread(
+        compose_travel_plan,
+        request=travel_request,
+        profile=state.get('trip_profile', {}),
+        route_options=state.get('route_options', []),
+        data_source=state.get('data_source', 'fallback'),
+        route_error=state.get('route_error'),
+        location_debug=state.get('location_debug', {}),
+        route_context=state.get('route_context', {}),
+        poi_candidates=state.get('poi_candidates', {}),
+        weather_context=state.get('weather_context', {}),
+        ranked_pois=state.get('ranked_pois', {}),
+        daily_itinerary=state.get('daily_itinerary'),
+    )
     notes = state.get('processing_notes', [])
     response = {
         'conversation_id': travel_plan.conversation_id,

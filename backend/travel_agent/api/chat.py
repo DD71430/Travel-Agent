@@ -135,7 +135,7 @@ async def multimodal_chat(
     response = await _run_graph(request_payload, upload_context)
     if upload_context and not str(response.get('final_answer') or '').strip():
         if upload_context.get('file_kind') == 'image':
-            response['final_answer'] = f'已接收图片 {upload_context["filename"]}'
+            response['final_answer'] = f'已接收图片 {upload_context["filename"]}；当前版本暂未解析图片内容，可补充文字需求。'
         else:
             response['final_answer'] = f'已接收{upload_context.get("file_kind", "文件")} {upload_context["filename"]}'
     _remember(conversation_id, question, response, intent, upload_context)
