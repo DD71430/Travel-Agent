@@ -60,6 +60,9 @@ type WeatherDay = {
   outdoor_suitability?: string
   indoor_priority?: boolean
   strategy?: string
+  weather_tips?: string[]
+  packing_tips?: string[]
+  weather_tags?: string[]
 }
 
 type WeatherContext = {
@@ -95,6 +98,9 @@ type TripDayPlan = {
   drive_time?: string
   visit_time?: string
   weather_strategy?: string | null
+  weather_tips?: string[]
+  packing_tips?: string[]
+  weather_tags?: string[]
   morning: string
   afternoon: string
   evening: string
@@ -493,13 +499,33 @@ function PlanCard({ plan }: { plan: TravelPlanResponse }) {
             {(() => {
               const weatherDay = dailyWeather[day.day - 1]
               const isFallbackWeather = weatherContext?.data_source === 'fallback'
-              return weatherDay ? (
-                <div className="weather-chip-row">
-                  <span>{formatWeatherDay(weatherDay, isFallbackWeather)}</span>
-                  <strong>{getWeatherBadge(weatherDay, isFallbackWeather)}</strong>
-                  <small>{isFallbackWeather ? '保留室内/室外备选' : weatherDay.strategy}</small>
-                </div>
-              ) : null
+              const weatherTips = dedupeStrings(day.weather_tips?.length ? day.weather_tips : weatherDay?.weather_tips)
+              const packingTips = dedupeStrings(day.packing_tips?.length ? day.packing_tips : weatherDay?.packing_tips)
+              return (
+                <>
+                  {weatherDay ? (
+                    <div className="weather-chip-row">
+                      <span>{formatWeatherDay(weatherDay, isFallbackWeather)}</span>
+                      <strong>{getWeatherBadge(weatherDay, isFallbackWeather)}</strong>
+                      <small>{isFallbackWeather ? '保留室内/室外备选' : weatherDay.strategy}</small>
+                    </div>
+                  ) : null}
+                  {weatherTips.length || packingTips.length ? (
+                    <div className="weather-tip-panel">
+                      {weatherTips.length ? (
+                        <ul className="weather-tip-list">
+                          {weatherTips.slice(0, 3).map((tip) => <li key={tip}>{tip}</li>)}
+                        </ul>
+                      ) : null}
+                      {packingTips.length ? (
+                        <div className="packing-chip-row">
+                          {packingTips.slice(0, 6).map((tip) => <span key={tip}>{tip}</span>)}
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </>
+              )
             })()}
             <div className="day-card-head">
               <strong>第{day.day}天</strong>

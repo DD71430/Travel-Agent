@@ -450,6 +450,39 @@ select:focus {
   padding: 4px 8px;
 }
 
+.weather-tip-panel {
+  background: #f5fbff;
+  border: 1px solid #d6e8ff;
+  border-radius: 12px;
+  padding: 10px 12px;
+  display: grid;
+  gap: 8px;
+}
+
+.weather-tip-list {
+  margin: 0;
+  padding-left: 18px;
+  color: #27405f;
+  line-height: 1.6;
+  font-size: 13px;
+}
+
+.packing-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.packing-chip-row span {
+  background: #fff7ed;
+  color: #9a3412;
+  border: 1px solid #fed7aa;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 5px 9px;
+}
+
 .note-row {
   display: flex;
   gap: 8px;

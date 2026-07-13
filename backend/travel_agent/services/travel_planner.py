@@ -27,7 +27,7 @@ from travel_agent.services.poi_candidate_service import (
 )
 from travel_agent.services.route_stop_service import infer_route_stops
 from travel_agent.services.trip_profile_service import build_trip_profile, decide_trip_type, score_poi
-from travel_agent.services.weather_service import build_weather_context
+from travel_agent.services.weather_service import build_weather_context, build_weather_tips
 from travel_agent.tools.tencent_webservice_client import TencentWebServiceClient, TencentWebServiceError
 
 settings = get_settings()
@@ -1398,7 +1398,7 @@ def _estimate_attraction_duration(name: str, category: str | None = None) -> tup
     for keywords, minute_range, note in _ATTRACTION_DURATION_RULES:
         if any(keyword in combined for keyword in keywords):
             return round((minute_range[0] + minute_range[1]) / 2), note
-    return 120, '适合按经典游览强度安排'
+    return 120, '适合按常规游览节奏安排'
 
 
 
@@ -1603,6 +1603,91 @@ def _fallback_attraction_names_for_city(city: str) -> list[str]:
     return [f'{clean}博物馆', f'{clean}风景名胜区', f'{clean}历史文化街区', f'{clean}公园', f'{clean}古城']
 
 
+def normalize_poi_identity(poi: dict[str, Any]) -> str:
+    name = _clean_attraction_name(str(poi.get('name') or poi.get('title') or ''))
+    address = str(poi.get('address') or '').strip()
+    source = name or address
+    normalized = re.sub(r'[\s·,，。:：;；()（）/|｜\-]+', '', source)
+    return normalized.replace('市', '')
+
+
+def classify_poi_bucket(poi: dict[str, Any]) -> str:
+    combined = ' '.join(str(poi.get(key) or '') for key in ('name', 'title', 'category', 'type', 'address'))
+    bucket_rules: list[tuple[str, tuple[str, ...]]] = [
+        ('museum', ('博物馆', '美术馆', '纪念馆', '科技馆', '展览馆', '非遗馆')),
+        ('historic_block', ('历史文化街区', '文化街区', '古城', '古镇', '老街', '城墙', '遗址', '古迹')),
+        ('lake_park', ('西湖', '湖', '公园', '湿地', '步道', '绿道', '滨河')),
+        ('temple', ('寺', '庙', '塔', '书院')),
+        ('theme_park', ('乐园', '动物园', '植物园', '海洋馆')),
+        ('nature', ('山', '岛', '森林', '风景区', '风景名胜')),
+        ('landmark', ('地标', '观景台')),
+    ]
+    for bucket, keywords in bucket_rules:
+        if any(keyword in combined for keyword in keywords):
+            return bucket
+    return 'unknown'
+
+
+def _is_generic_filler_name(name: str, anchor_city: str) -> bool:
+    clean_name = _clean_attraction_name(name)
+    city = _clean_city(anchor_city)
+    if not clean_name:
+        return True
+    if any(token in clean_name for token in ('经典景点', '经典游览', '综合匹配')):
+        return True
+    generic_names = {
+        f'{city}风景名胜区',
+        f'{city}历史文化街区',
+        f'{city}公园',
+        f'{city}古城',
+        f'{city}城市公园',
+        f'{city}地标建筑',
+        f'{city}非遗体验馆',
+    }
+    return bool(city and clean_name in generic_names)
+
+
+def select_unique_day_pois(
+    *,
+    anchor_city: str,
+    stage: str,
+    candidates: list[dict[str, Any]],
+    used_names: set[str],
+    used_buckets_by_day: set[str],
+    max_count: int,
+    allow_repeat_must_visit: bool = True,
+) -> list[dict[str, str]]:
+    selected: list[dict[str, str]] = []
+    local_identities: set[str] = set()
+    selected_buckets = set(used_buckets_by_day)
+    _ = stage
+    for candidate in candidates:
+        name = str(candidate.get('name') or candidate.get('title') or '').strip()
+        if not name:
+            continue
+        must_visit = bool(candidate.get('must_visit')) or str(candidate.get('must_visit')).lower() == 'true'
+        if _is_generic_filler_name(name, anchor_city) and not must_visit:
+            continue
+        identity = normalize_poi_identity(candidate)
+        if identity and identity in local_identities:
+            continue
+        if identity and identity in used_names and not (must_visit and allow_repeat_must_visit):
+            continue
+        bucket = classify_poi_bucket(candidate)
+        if bucket != 'unknown' and bucket in selected_buckets and not (must_visit and allow_repeat_must_visit):
+            continue
+        normalized = {key: str(value) for key, value in candidate.items() if value is not None}
+        selected.append(normalized)
+        if identity:
+            local_identities.add(identity)
+        if bucket != 'unknown':
+            selected_buckets.add(bucket)
+            used_buckets_by_day.add(bucket)
+        if len(selected) >= max(0, max_count):
+            break
+    return selected
+
+
 def _candidate_pois_for_day(
     *,
     anchor_city: str,
@@ -1636,13 +1721,6 @@ def _candidate_pois_for_day(
                 continue
             if is_valid_attraction_poi(item) and is_poi_in_planning_scope(item, anchor_city, {**route_context, 'stage': stage}, profile):
                 candidates.append({key: str(value) for key, value in item.items() if value is not None})
-            if len(candidates) >= 6:
-                break
-    if len(candidates) < 3:
-        for poi in _resolve_attraction_pois(anchor_city, _fallback_attraction_names_for_city(anchor_city)):
-            name = str(poi.get('name') or '').strip()
-            if name and name not in used_attractions and not any(existing.get('name') == name for existing in candidates) and is_valid_attraction_poi(poi) and is_poi_in_planning_scope(poi, anchor_city, {**route_context, 'stage': stage}, profile):
-                candidates.append(poi)
             if len(candidates) >= 6:
                 break
     return candidates
@@ -1823,12 +1901,12 @@ def _build_trip_itinerary(
         enriched['tags'] = '、'.join(str(tag) for tag in score.get('tags', [])) if isinstance(score.get('tags'), list) else ''
         scored_attraction_pois.append(enriched)
     attraction_pois = sorted(scored_attraction_pois or attraction_pois, key=lambda item: float(item.get('score') or 0), reverse=True)
-    base_attraction_pool = list(attraction_pool)
     base_attraction_pois = list(attraction_pois)
     itinerary: list[TripDayPlan] = []
     total_drive_minutes = _parse_duration_minutes(best_option.duration)
     drive_segments = _estimate_drive_segments(total_drive_minutes, days)
     used_attractions: set[str] = set()
+    used_poi_identities: set[str] = set()
     stage_counts = route_context.get('stage_counts') if isinstance(route_context.get('stage_counts'), dict) else {}
     stage_notes = [str(item) for item in stage_counts.get('stage_notes', [])] if isinstance(stage_counts, dict) else []
     weather_context = route_context.get('weather_context') if isinstance(route_context.get('weather_context'), dict) else {}
@@ -1837,7 +1915,7 @@ def _build_trip_itinerary(
         if '轻松' in travel_style or '老人' in preferences or '亲子' in preferences:
             pace_note = '节奏偏轻松，建议每个景点之间预留休息与机动时间。'
         else:
-            pace_note = '节奏为经典游览强度，建议把核心景点放在上午与下午前段完成。'
+            pace_note = '节奏为常规游览强度，建议把核心景点放在上午与下午前段完成。'
         day_context = next((item for item in route_context.get('daily_plan_context', []) if item.get('day') == day), {})
         weather_day = daily_weather[day - 1] if isinstance(daily_weather, list) and day - 1 < len(daily_weather) and isinstance(daily_weather[day - 1], dict) else None
         stage = str(day_context.get('stage') or 'destination')
@@ -1848,6 +1926,8 @@ def _build_trip_itinerary(
         anchor_city = str(day_context.get('anchor_city') or destination)
         route_segment = str(day_context.get('route_segment') or '')
         segment_data_source = str(day_context.get('segment_data_source') or 'fallback_estimated')
+        if stage == 'buffer':
+            recommended_spots = min(recommended_spots, 1)
         effective_weather = _effective_weather_day(weather_context, weather_day)
         day_candidate_pois = _candidate_pois_for_day(
             anchor_city=anchor_city,
@@ -1858,60 +1938,40 @@ def _build_trip_itinerary(
             route_context=route_context,
             used_attractions=used_attractions,
         )
-        if day_candidate_pois:
-            attraction_pool = [str(item.get('name')) for item in day_candidate_pois if item.get('name')]
-            attraction_pois = day_candidate_pois
-        else:
-            attraction_pool = base_attraction_pool
-            attraction_pois = base_attraction_pois
-        available_pool = [item for item in attraction_pool if item not in used_attractions]
-        day_pool = available_pool[:recommended_spots]
-        if len(day_pool) < 3:
-            fallback_pool = [item for item in attraction_pool if item not in day_pool and item in used_attractions]
-            day_pool = (day_pool + fallback_pool)[:3]
-        if len(day_pool) < 3:
-            remainder = [item for item in attraction_pool if item not in day_pool]
-            day_pool = (day_pool + remainder)[:3]
-        if len(day_pool) < 3:
-            day_pool = (attraction_pool + attraction_pool[:3])[:3]
-        if len(day_pool) < 3:
-            for fallback_name in _fallback_attraction_names_for_city(anchor_city):
-                if fallback_name not in day_pool:
-                    day_pool.append(fallback_name)
-                if len(day_pool) >= 3:
-                    break
-        morning_spot, afternoon_spot, evening_spot = day_pool[:3]
-        available_pois = [item for item in attraction_pois if item.get('name') not in used_attractions]
-        base_candidates = available_pois or attraction_pois
-        morning_poi = _select_poi_for_day(base_candidates, morning_spot, day - 1)
-        used_names = {morning_poi.get('name')} if morning_poi and morning_poi.get('name') else set()
-        afternoon_candidates = [item for item in base_candidates if item.get('name') not in used_names]
-        afternoon_poi = _select_poi_for_day(afternoon_candidates or base_candidates, afternoon_spot, day, morning_poi.get('location') if morning_poi else None)
-        if afternoon_poi and afternoon_poi.get('name'):
-            used_names.add(afternoon_poi.get('name'))
-        evening_candidates = [item for item in base_candidates if item.get('name') not in used_names]
-        evening_poi = _select_poi_for_day(evening_candidates or base_candidates, evening_spot, day + 1, afternoon_poi.get('location') if afternoon_poi else (morning_poi.get('location') if morning_poi else None))
+        candidate_pois = day_candidate_pois or base_attraction_pois
+        used_buckets_by_day: set[str] = set()
+        selected_pois = select_unique_day_pois(
+            anchor_city=anchor_city,
+            stage=stage,
+            candidates=candidate_pois,
+            used_names=used_poi_identities,
+            used_buckets_by_day=used_buckets_by_day,
+            max_count=recommended_spots,
+        )
+        morning_poi = selected_pois[0] if len(selected_pois) >= 1 else None
+        afternoon_poi = selected_pois[1] if len(selected_pois) >= 2 else None
+        evening_poi = selected_pois[2] if len(selected_pois) >= 3 else None
         if not drive_today:
             drive_today = drive_segments[min(day - 1, len(drive_segments) - 1)] if drive_segments else 0
         if stage == 'destination':
             drive_today = min(drive_today, 45)
         elif stage == 'buffer':
             drive_today = min(drive_today, 90)
-        morning_name = (morning_poi or {}).get('name') or morning_spot
-        afternoon_name = (afternoon_poi or {}).get('name') or afternoon_spot
-        evening_name = (evening_poi or {}).get('name') or evening_spot
+        morning_name = (morning_poi or {}).get('name') or ''
+        afternoon_name = (afternoon_poi or {}).get('name') or ''
+        evening_name = (evening_poi or {}).get('name') or ''
         morning_addr = (morning_poi or {}).get('address') or ''
         afternoon_addr = (afternoon_poi or {}).get('address') or ''
         evening_addr = (evening_poi or {}).get('address') or ''
-        morning_duration, morning_note = _estimate_attraction_duration(morning_name, (morning_poi or {}).get('category'))
-        afternoon_duration, afternoon_note = _estimate_attraction_duration(afternoon_name, (afternoon_poi or {}).get('category'))
-        evening_duration, evening_note = _estimate_attraction_duration(evening_name, (evening_poi or {}).get('category'))
+        morning_duration, morning_note = _estimate_attraction_duration(morning_name, (morning_poi or {}).get('category')) if morning_poi else (0, '')
+        afternoon_duration, afternoon_note = _estimate_attraction_duration(afternoon_name, (afternoon_poi or {}).get('category')) if afternoon_poi else (0, '')
+        evening_duration, evening_note = _estimate_attraction_duration(evening_name, (evening_poi or {}).get('category')) if evening_poi else (0, '')
         move_1 = _location_distance((morning_poi or {}).get('location'), (afternoon_poi or {}).get('location'))
         move_2 = _location_distance((afternoon_poi or {}).get('location'), (evening_poi or {}).get('location'))
-        transfer_1 = 20 if move_1 is not None and move_1 < 0.03 else 40
-        transfer_2 = 20 if move_2 is not None and move_2 < 0.03 else 35
-        move_1_text = '两点距离较近，建议步行或短途接驳。' if transfer_1 == 20 else '两点之间建议预留 30-40 分钟交通切换。'
-        move_2_text = '傍晚景点与下午景点衔接紧凑，可减少折返。' if transfer_2 == 20 else '晚间景点建议根据体力决定是否保留。'
+        transfer_1 = 20 if morning_poi and afternoon_poi and move_1 is not None and move_1 < 0.03 else 40 if morning_poi and afternoon_poi else 0
+        transfer_2 = 20 if afternoon_poi and evening_poi and move_2 is not None and move_2 < 0.03 else 35 if afternoon_poi and evening_poi else 0
+        move_1_text = '两点距离较近，建议步行或短途接驳。' if transfer_1 == 20 else '两点之间建议预留 30-40 分钟交通切换。' if transfer_1 else ''
+        move_2_text = '傍晚景点与下午景点衔接紧凑，可减少折返。' if transfer_2 == 20 else '晚间景点建议根据体力决定是否保留。' if transfer_2 else ''
         meal_hotel_notes = _build_meal_and_hotel_notes(anchor_city, morning_poi, afternoon_poi, evening_poi, None, None, day - 1)
         stage_score_context = {**route_context, **day_context, 'stage': stage, 'weather_day': effective_weather}
         day_attractions = []
@@ -1925,8 +1985,10 @@ def _build_trip_itinerary(
             rescored['reason'] = str(score['reason'])
             rescored['tags'] = '、'.join(str(tag) for tag in score.get('tags', [])) if isinstance(score.get('tags'), list) else str(rescored.get('tags') or '')
             day_attractions.append(rescored)
-        day_reasons = [str(item.get('reason')) for item in day_attractions if item.get('reason')]
-        day_tags = _dedupe_text([tag for item in day_attractions for tag in str(item.get('tags') or '').split('、') if tag])
+        day_reasons = [str(item.get('reason')) for item in day_attractions if item.get('reason') and '综合匹配' not in str(item.get('reason'))]
+        if not day_reasons and day_attractions:
+            day_reasons = [f'{anchor_city}当天候选与{route_segment or "当日路线"}和可游览时间匹配。']
+        day_tags = _dedupe_text([tag for item in day_attractions for tag in str(item.get('tags') or '').split('、') if tag and tag != '综合匹配'])
         required_today = [str(item.get('name')) for item in day_attractions if str(item.get('must_visit')).lower() == 'true']
         meal_notes = [note for note in meal_hotel_notes if note.startswith(('午餐', '晚餐'))]
         hotel_note = next((note for note in meal_hotel_notes if note.startswith('住宿')), None)
@@ -1947,47 +2009,72 @@ def _build_trip_itinerary(
         if stage == 'route' and request.travel_mode == 'driving' and drive_today >= 180:
             drive_start_hour, drive_start_minute = 8, 0
             drive_end_hour, drive_end_minute = _shift_minutes(drive_start_hour, drive_start_minute, drive_today)
-            morning_end_hour, morning_end_minute = _shift_minutes(drive_end_hour, drive_end_minute, morning_duration)
-            afternoon_start_hour, afternoon_start_minute = _shift_minutes(morning_end_hour, morning_end_minute, transfer_1 + 40)
-            afternoon_end_hour, afternoon_end_minute = _shift_minutes(afternoon_start_hour, afternoon_start_minute, afternoon_duration)
-            evening_start_hour, evening_start_minute = _shift_minutes(afternoon_end_hour, afternoon_end_minute, transfer_2 + 20)
-            evening_end_hour, evening_end_minute = _shift_minutes(evening_start_hour, evening_start_minute, min(evening_duration, 120))
-            morning = (
-                f'{_format_time(drive_start_hour, drive_start_minute)}-{_format_time(morning_end_hour, morning_end_minute)} '
-                f'先完成长距离抵达，预计驾驶约{max(1, round(drive_today / 60))}小时；抵达后游览 {morning_name}{f"（{morning_addr}）" if morning_addr else ""}，'
-                f'建议停留 {_format_duration_minutes(morning_duration)}，{morning_note}。'
-            )
-            afternoon = (
-                f'{_format_time(afternoon_start_hour, afternoon_start_minute)}-{_format_time(afternoon_end_hour, afternoon_end_minute)} '
-                f'前往 {afternoon_name}{f"（{afternoon_addr}）" if afternoon_addr else ""}，建议停留 {_format_duration_minutes(afternoon_duration)}；'
-                f'该段重点考虑与上午景点的衔接效率。{move_1_text}'
-            )
-            evening = (
-                f'{_format_time(evening_start_hour, evening_start_minute)}-{_format_time(evening_end_hour, evening_end_minute)} '
-                f'视体力补充 {evening_name}{f"（{evening_addr}）" if evening_addr else ""}，建议停留 {_format_duration_minutes(min(evening_duration, 120))}；{evening_note}。{move_2_text}'
-            )
+            if morning_poi:
+                morning_end_hour, morning_end_minute = _shift_minutes(drive_end_hour, drive_end_minute, morning_duration)
+                morning = (
+                    f'{_format_time(drive_start_hour, drive_start_minute)}-{_format_time(morning_end_hour, morning_end_minute)} '
+                    f'先完成长距离抵达，预计驾驶约{max(1, round(drive_today / 60))}小时；抵达后游览 {morning_name}{f"（{morning_addr}）" if morning_addr else ""}，'
+                    f'建议停留 {_format_duration_minutes(morning_duration)}，{morning_note}。'
+                )
+            else:
+                morning_end_hour, morning_end_minute = _shift_minutes(drive_end_hour, drive_end_minute, 90)
+                morning = (
+                    f'{_format_time(drive_start_hour, drive_start_minute)}-{_format_time(morning_end_hour, morning_end_minute)} '
+                    f'先完成长距离抵达，预计驾驶约{max(1, round(drive_today / 60))}小时；抵达{anchor_city}后办理停车、补给或入住，保留轻量休整。'
+                )
+            if afternoon_poi:
+                afternoon_start_hour, afternoon_start_minute = _shift_minutes(morning_end_hour, morning_end_minute, transfer_1 + 40)
+                afternoon_end_hour, afternoon_end_minute = _shift_minutes(afternoon_start_hour, afternoon_start_minute, afternoon_duration)
+                afternoon = (
+                    f'{_format_time(afternoon_start_hour, afternoon_start_minute)}-{_format_time(afternoon_end_hour, afternoon_end_minute)} '
+                    f'前往 {afternoon_name}{f"（{afternoon_addr}）" if afternoon_addr else ""}，建议停留 {_format_duration_minutes(afternoon_duration)}；'
+                    f'该段重点考虑与上午景点的衔接效率。{move_1_text}'
+                )
+            else:
+                afternoon_end_hour, afternoon_end_minute = _shift_minutes(morning_end_hour, morning_end_minute, 150)
+                afternoon = f'下午保留为抵达、入住或休整时间，可在{anchor_city}核心区轻量散步，不强行增加景点。'
+            if evening_poi:
+                evening_start_hour, evening_start_minute = _shift_minutes(afternoon_end_hour, afternoon_end_minute, transfer_2 + 20)
+                evening_end_hour, evening_end_minute = _shift_minutes(evening_start_hour, evening_start_minute, min(evening_duration, 120))
+                evening = (
+                    f'{_format_time(evening_start_hour, evening_start_minute)}-{_format_time(evening_end_hour, evening_end_minute)} '
+                    f'视体力补充 {evening_name}{f"（{evening_addr}）" if evening_addr else ""}，建议停留 {_format_duration_minutes(min(evening_duration, 120))}；{evening_note}。{move_2_text}'
+                )
+            else:
+                evening = '晚间以就近用餐和休息为主，避免长距离驾驶后的路途疲劳。'
         else:
             morning_start_hour, morning_start_minute = 8, 30
-            morning_end_hour, morning_end_minute = _shift_minutes(morning_start_hour, morning_start_minute, morning_duration)
-            afternoon_start_hour, afternoon_start_minute = _shift_minutes(morning_end_hour, morning_end_minute, transfer_1 + 60)
-            afternoon_end_hour, afternoon_end_minute = _shift_minutes(afternoon_start_hour, afternoon_start_minute, afternoon_duration)
-            evening_start_hour, evening_start_minute = _shift_minutes(afternoon_end_hour, afternoon_end_minute, transfer_2 + 20)
-            evening_end_hour, evening_end_minute = _shift_minutes(evening_start_hour, evening_start_minute, min(evening_duration, 120))
-            morning = (
-                f'{_format_time(morning_start_hour, morning_start_minute)}-{_format_time(morning_end_hour, morning_end_minute)} '
-                f'上午主攻 {morning_name}{f"（{morning_addr}）" if morning_addr else ""}，建议停留 {_format_duration_minutes(morning_duration)}；'
-                f'{morning_note}，如为热门博物馆/古迹类景点建议提前预约。'
-            )
-            afternoon = (
-                f'{_format_time(afternoon_start_hour, afternoon_start_minute)}-{_format_time(afternoon_end_hour, afternoon_end_minute)} '
-                f'下午转场至 {afternoon_name}{f"（{afternoon_addr}）" if afternoon_addr else ""}，建议停留 {_format_duration_minutes(afternoon_duration)}；'
-                f'优先把经典看点、主展线或核心游览段放在这一时段完成。{move_1_text}'
-            )
-            evening = (
-                f'{_format_time(evening_start_hour, evening_start_minute)}-{_format_time(evening_end_hour, evening_end_minute)} '
-                f'傍晚安排 {evening_name}{f"（{evening_addr}）" if evening_addr else ""}，建议停留 {_format_duration_minutes(min(evening_duration, 120))}；'
-                f'{evening_note}。{move_2_text}'
-            )
+            if morning_poi:
+                morning_end_hour, morning_end_minute = _shift_minutes(morning_start_hour, morning_start_minute, morning_duration)
+                morning = (
+                    f'{_format_time(morning_start_hour, morning_start_minute)}-{_format_time(morning_end_hour, morning_end_minute)} '
+                    f'上午主攻 {morning_name}{f"（{morning_addr}）" if morning_addr else ""}，建议停留 {_format_duration_minutes(morning_duration)}；'
+                    f'{morning_note}，如为热门博物馆/古迹类景点建议提前预约。'
+                )
+            else:
+                morning_end_hour, morning_end_minute = _shift_minutes(morning_start_hour, morning_start_minute, 120)
+                morning = f'09:30-11:30 熟悉{anchor_city}核心区域，保留自由活动或预约核验时间，不强行增加景点。'
+            if afternoon_poi:
+                afternoon_start_hour, afternoon_start_minute = _shift_minutes(morning_end_hour, morning_end_minute, transfer_1 + 60)
+                afternoon_end_hour, afternoon_end_minute = _shift_minutes(afternoon_start_hour, afternoon_start_minute, afternoon_duration)
+                afternoon = (
+                    f'{_format_time(afternoon_start_hour, afternoon_start_minute)}-{_format_time(afternoon_end_hour, afternoon_end_minute)} '
+                    f'下午转场至 {afternoon_name}{f"（{afternoon_addr}）" if afternoon_addr else ""}，建议停留 {_format_duration_minutes(afternoon_duration)}；'
+                    f'优先把核心看点、主展线或主要游览段放在这一时段完成。{move_1_text}'
+                )
+            else:
+                afternoon_end_hour, afternoon_end_minute = _shift_minutes(morning_end_hour, morning_end_minute, 180)
+                afternoon = f'下午保留为抵达、入住、休整或自由活动，可在{anchor_city}就近轻量散步。'
+            if evening_poi:
+                evening_start_hour, evening_start_minute = _shift_minutes(afternoon_end_hour, afternoon_end_minute, transfer_2 + 20)
+                evening_end_hour, evening_end_minute = _shift_minutes(evening_start_hour, evening_start_minute, min(evening_duration, 120))
+                evening = (
+                    f'{_format_time(evening_start_hour, evening_start_minute)}-{_format_time(evening_end_hour, evening_end_minute)} '
+                    f'傍晚安排 {evening_name}{f"（{evening_addr}）" if evening_addr else ""}，建议停留 {_format_duration_minutes(min(evening_duration, 120))}；'
+                    f'{evening_note}。{move_2_text}'
+                )
+            else:
+                evening = '晚间以就近用餐、整理行李和休息为主，根据体力决定是否自由活动。'
         if stage == 'destination':
             morning = morning.replace('上午主攻', f'目的地第{stage_day}天上午主攻')
             afternoon = afternoon.replace('下午转场至', '下午在目的地内转场至')
@@ -1998,7 +2085,7 @@ def _build_trip_itinerary(
             elif effective_weather and effective_weather.get('outdoor_suitability') == 'good':
                 morning = morning.replace('目的地第', '天气适合室外：目的地第')
         elif stage == 'buffer':
-            morning = f'09:30-11:30 保留机动时间，可补充 {morning_name} 或处理返程/换乘安排。'
+            morning = f'09:30-11:30 保留机动时间，可补充 {morning_name} 或处理返程/换乘安排。' if morning_poi else '09:30-11:30 保留机动时间，处理返程、换乘或补漏预约事项。'
             afternoon = '下午根据天气、体力和返程时间自由调整，不再强行增加远距离景点。'
             evening = '晚间以就近用餐、整理行李和休息为主。'
         if weather_context.get('data_source') == 'fallback':
@@ -2011,13 +2098,36 @@ def _build_trip_itinerary(
                 weather_label = f'当天天气：{anchor_city} 天气待确认。'
             else:
                 weather_label = f"当天天气：{weather_day.get('city', anchor_city)} {weather_day.get('weather', '天气待确认')}，{weather_day.get('temperature', '温度待确认')}。"
+        generated_weather_tips = build_weather_tips(weather_day, data_source=str(weather_context.get('data_source') or 'fallback')) if weather_day else {}
+
+        def structured_weather_list(key: str) -> list[str]:
+            explicit = (weather_day or {}).get(key, [])
+            items = explicit if isinstance(explicit, list) else []
+            generated = generated_weather_tips.get(key, []) if isinstance(generated_weather_tips.get(key), list) else []
+            return _dedupe_text([str(item) for item in [*items, *generated] if str(item).strip()])
+
+        weather_tips = structured_weather_list('weather_tips')
+        packing_tips = structured_weather_list('packing_tips')
+        weather_tags = structured_weather_list('weather_tags')
+        total_visit_minutes = morning_duration + afternoon_duration + min(evening_duration, 120)
+        visit_note = (
+            f'当日景点建议停留总时长约 {_format_duration_minutes(total_visit_minutes)}。'
+            if total_visit_minutes
+            else '当天不强行安排固定景点，以抵达、休整和自由活动为主。'
+        )
+        if len(day_attractions) >= 3:
+            transfer_note = f'景点转场参考：上午到下午约预留 {transfer_1} 分钟，下午到傍晚约预留 {transfer_2} 分钟。'
+        elif len(day_attractions) == 2:
+            transfer_note = f'景点转场参考：两个景点之间约预留 {transfer_1 or 30} 分钟，优先减少折返。'
+        else:
+            transfer_note = '景点转场参考：当天景点较少，优先减少折返并保留体力。'
         notes = [
             stage_note,
             pace_note,
             weather_label,
             f'天气策略：{weather_strategy}',
-            f'当日景点建议停留总时长约 {_format_duration_minutes(morning_duration + afternoon_duration + min(evening_duration, 120))}。',
-            f'景点转场参考：上午到下午约预留 {transfer_1} 分钟，下午到傍晚约预留 {transfer_2} 分钟。',
+            visit_note,
+            transfer_note,
             f'当日路线段：{route_segment}，{"预计" if segment_data_source != "tencent_maps" else "腾讯地图"}行驶/转场约{_format_duration_minutes(drive_today)}。',
             f'当天包含用户指定途经点/必去景点：{"、".join(required_today)}。' if required_today else '',
             *stage_notes,
@@ -2026,6 +2136,10 @@ def _build_trip_itinerary(
         for used_name in (morning_name, afternoon_name, evening_name):
             if used_name:
                 used_attractions.add(used_name)
+        for poi in day_attractions:
+            identity = normalize_poi_identity(poi)
+            if identity:
+                used_poi_identities.add(identity)
         itinerary.append(
             TripDayPlan(
                 day=day,
@@ -2037,9 +2151,12 @@ def _build_trip_itinerary(
                 drive_time=_format_duration_minutes(drive_today),
                 visit_time=_format_duration_minutes(available_visit_minutes),
                 weather_strategy=weather_strategy,
+                weather_tips=weather_tips,
+                packing_tips=packing_tips,
+                weather_tags=weather_tags,
                 morning=morning,
-                afternoon=afternoon if recommended_spots >= 2 else '保留为抵达、入住或休息时间，不强行增加景点。',
-                evening=evening if recommended_spots >= 3 else '晚间以就近用餐和休息为主，避免路途疲劳。',
+                afternoon=afternoon,
+                evening=evening,
                 attractions=[
                     {
                         'name': item.get('name', ''),

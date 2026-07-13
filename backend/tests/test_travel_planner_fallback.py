@@ -250,6 +250,187 @@ def test_tencent_rain_weather_can_prioritize_indoor(monkeypatch):
     assert any('雨天优先室内' in reason for day in plan.daily_itinerary for reason in day.recommendation_reasons + day.notes)
 
 
+def test_select_unique_day_pois_removes_duplicate_names_and_buckets():
+    candidates = [
+        {'name': '杭州博物馆', 'category': '博物馆'},
+        {'name': '杭州博物馆', 'category': '博物馆'},
+        {'name': '浙江省博物馆', 'category': '博物馆'},
+        {'name': '小河直街历史文化街区', 'category': '历史文化街区'},
+    ]
+
+    selected = travel_planner.select_unique_day_pois(
+        anchor_city='杭州',
+        stage='destination',
+        candidates=candidates,
+        used_names=set(),
+        used_buckets_by_day=set(),
+        max_count=3,
+    )
+
+    names = [item['name'] for item in selected]
+    assert names.count('杭州博物馆') == 1
+    assert len([item for item in selected if travel_planner.classify_poi_bucket(item) == 'museum']) == 1
+
+
+def test_daily_itinerary_avoids_generic_fillers_and_cross_day_repeats(monkeypatch):
+    monkeypatch.setattr(travel_planner.settings, 'tencent_maps_key', '')
+    monkeypatch.setattr(travel_planner._client, 'key', '')
+    request = build_travel_request(ChatRequest(question='从济南自驾到杭州三天两晚，在徐州停留一天，剩余时间在杭州游玩'))
+
+    plan = travel_planner.build_travel_plan(request)
+
+    attraction_names_by_day = [[item['name'] for item in day.attractions] for day in plan.daily_itinerary]
+    for names in attraction_names_by_day:
+        assert len(names) == len(set(names))
+
+    all_names = [name for names in attraction_names_by_day for name in names]
+    assert len(all_names) == len(set(all_names))
+    assert not any('经典景点' in name or name == '杭州风景名胜区' for name in all_names)
+    assert not any('综合匹配' in reason for day in plan.daily_itinerary for reason in day.recommendation_reasons)
+    assert not any('经典游览强度' in note for day in plan.daily_itinerary for note in day.notes)
+    assert all(len(day.recommendation_reasons) <= 3 for day in plan.daily_itinerary)
+    for day in plan.daily_itinerary:
+        note_text = ' '.join(day.notes)
+        assert not any(reason and reason in note_text for reason in day.recommendation_reasons)
+
+
+def test_limited_candidates_do_not_force_three_generic_attractions(monkeypatch):
+    monkeypatch.setattr(travel_planner.settings, 'tencent_maps_key', '')
+    monkeypatch.setattr(travel_planner._client, 'key', '')
+
+    def fake_candidates_for_day(**kwargs):
+        return [{'name': '杭州博物馆', 'category': '博物馆', 'address': '杭州市上城区', 'estimated_minutes': '150'}]
+
+    monkeypatch.setattr(travel_planner, '_candidate_pois_for_day', fake_candidates_for_day)
+    request = build_travel_request(ChatRequest(question='从济南自驾到杭州三天两晚，在徐州停留一天，剩余时间在杭州游玩'))
+
+    plan = travel_planner.build_travel_plan(request)
+
+    first_day = plan.daily_itinerary[0]
+    assert len(first_day.attractions) == 1
+    assert not any('风景名胜区' in item['name'] or '经典景点' in item['name'] for item in first_day.attractions)
+    assert any(token in f'{first_day.afternoon} {first_day.evening}' for token in ('休整', '轻量', '自由活动', '入住'))
+
+
+def test_tencent_weather_tips_are_added_to_daily_plan(monkeypatch):
+    monkeypatch.setattr(travel_planner.settings, 'tencent_maps_key', '')
+    monkeypatch.setattr(travel_planner._client, 'key', '')
+
+    def fake_weather_context(destination, route_stops=None, days=3, location_debug=None):
+        return {
+            'data_source': 'tencent_maps',
+            'destination': destination,
+            'summary': '杭州未来3天天气参考：阵雨；建议优先安排室内景点。',
+            'daily_weather': [
+                {
+                    'day': index,
+                    'city': '杭州',
+                    'weather': '阵雨',
+                    'temperature': '24-28℃',
+                    'outdoor_suitability': 'limited',
+                    'indoor_priority': True,
+                    'risk_level': 'medium',
+                    'strategy': '雨天优先室内，室外景点建议视天气压缩停留。',
+                    'weather_tags': ['rain'],
+                    'weather_tips': ['有降雨风险，建议携带雨伞或轻便雨衣。'],
+                    'packing_tips': ['雨伞或轻便雨衣'],
+                }
+                for index in range(1, days + 1)
+            ],
+            'warnings': [],
+            'request_debug': {'provider': 'tencent_maps', 'fallback_reason': None},
+        }
+
+    monkeypatch.setattr(travel_planner, 'build_weather_context', fake_weather_context)
+    request = build_travel_request(ChatRequest(question='从济南自驾到杭州三天两晚，在徐州停留一天，剩余时间在杭州游玩'))
+
+    plan = travel_planner.build_travel_plan(request)
+
+    assert 'rain' in plan.daily_itinerary[0].weather_tags
+    assert any('雨伞' in tip or '雨衣' in tip for tip in plan.daily_itinerary[0].weather_tips)
+    assert '雨伞或轻便雨衣' in plan.daily_itinerary[0].packing_tips
+
+
+def test_tencent_heat_weather_adds_sunscreen_tips_to_daily_plan(monkeypatch):
+    monkeypatch.setattr(travel_planner.settings, 'tencent_maps_key', '')
+    monkeypatch.setattr(travel_planner._client, 'key', '')
+
+    def fake_weather_context(destination, route_stops=None, days=3, location_debug=None):
+        return {
+            'data_source': 'tencent_maps',
+            'destination': destination,
+            'summary': '杭州未来3天天气参考：晴；注意防晒补水。',
+            'daily_weather': [
+                {
+                    'day': index,
+                    'city': '杭州',
+                    'weather': '晴',
+                    'temperature': '30-36℃',
+                    'outdoor_suitability': 'limited',
+                    'indoor_priority': True,
+                    'risk_level': 'medium',
+                    'strategy': '高温天气，中午避免室外，户外景点尽量安排在上午或傍晚。',
+                }
+                for index in range(1, days + 1)
+            ],
+            'warnings': [],
+            'request_debug': {'provider': 'tencent_maps', 'fallback_reason': None},
+        }
+
+    monkeypatch.setattr(travel_planner, 'build_weather_context', fake_weather_context)
+    request = build_travel_request(ChatRequest(question='从济南自驾到杭州三天两晚，在徐州停留一天，剩余时间在杭州游玩'))
+
+    plan = travel_planner.build_travel_plan(request)
+
+    assert 'sun_exposure' in plan.daily_itinerary[0].weather_tags
+    assert 'heat' in plan.daily_itinerary[0].weather_tags
+    assert any('防晒' in tip or '补水' in tip for tip in plan.daily_itinerary[0].weather_tips)
+    assert any('避开正午户外暴晒' in tip for tip in plan.daily_itinerary[0].weather_tips)
+    assert '防晒霜' in plan.daily_itinerary[0].packing_tips
+    assert '水杯' in plan.daily_itinerary[0].packing_tips
+
+
+def test_fallback_weather_tips_stay_optional_not_deterministic(monkeypatch):
+    monkeypatch.setattr(travel_planner.settings, 'tencent_maps_key', '')
+    monkeypatch.setattr(travel_planner._client, 'key', '')
+
+    def fake_weather_context(destination, route_stops=None, days=3, location_debug=None):
+        return {
+            'data_source': 'fallback',
+            'destination': destination,
+            'summary': '天气待确认，建议出行前查看实时天气；本行程保留室内/室外备选。',
+            'daily_weather': [
+                {
+                    'day': index,
+                    'city': '杭州',
+                    'weather': '天气待确认',
+                    'temperature': '温度待确认',
+                    'outdoor_suitability': 'unknown',
+                    'indoor_priority': False,
+                    'risk_level': 'unknown',
+                    'strategy': '天气待确认，建议出行前查看实时天气；本行程保留室内/室外备选。',
+                }
+                for index in range(1, days + 1)
+            ],
+            'warnings': ['weather_fallback'],
+            'request_debug': {'provider': 'fallback', 'fallback_reason': 'test'},
+        }
+
+    monkeypatch.setattr(travel_planner, 'build_weather_context', fake_weather_context)
+    request = build_travel_request(ChatRequest(question='从济南自驾到杭州三天两晚，在徐州停留一天，剩余时间在杭州游玩'))
+
+    plan = travel_planner.build_travel_plan(request)
+
+    combined = ' '.join(
+        [*plan.daily_itinerary[0].weather_tags, *plan.daily_itinerary[0].weather_tips, *plan.daily_itinerary[0].packing_tips]
+    )
+    assert 'weather_unconfirmed' in plan.daily_itinerary[0].weather_tags
+    assert '天气待确认' in combined
+    assert '保留雨具、防晒和补水用品作为备选' in combined
+    assert '今天下雨' not in combined
+    assert '今天高温' not in combined
+
+
 def test_daily_notes_do_not_duplicate_meals_hotels_or_reasons(monkeypatch):
     monkeypatch.setattr(travel_planner.settings, 'tencent_maps_key', '')
     monkeypatch.setattr(travel_planner._client, 'key', '')

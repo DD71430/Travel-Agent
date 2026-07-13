@@ -74,6 +74,9 @@ class TripDayPlan(BaseModel):
     drive_time: str | None = None
     visit_time: str | None = None
     weather_strategy: str | None = None
+    weather_tips: list[str] = Field(default_factory=list)
+    packing_tips: list[str] = Field(default_factory=list)
+    weather_tags: list[str] = Field(default_factory=list)
     morning: str
     afternoon: str
     evening: str
