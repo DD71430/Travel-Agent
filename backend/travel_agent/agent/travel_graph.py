@@ -133,14 +133,16 @@ async def _fetch_poi_candidates_node(state: UnifiedAgentState) -> UnifiedAgentSt
 
 
 async def _fetch_weather_context_node(state: UnifiedAgentState) -> UnifiedAgentState:
+    route_context = state.get('route_context', {})
     weather_context = await asyncio.to_thread(
         build_weather_context,
         state['travel_request'].destination,
         state.get('poi_candidates', {}).get('route_stops', []),
         int(state.get('trip_profile', {}).get('duration_days') or 3),
         state.get('location_debug', {}),
+        daily_plan_context=route_context.get('daily_plan_context', []),
     )
-    route_context = {**state.get('route_context', {}), 'weather_context': weather_context}
+    route_context = {**route_context, 'weather_context': weather_context}
     notes = [*state.get('processing_notes', []), 'weather_context_fetched']
     return {**state, 'weather_context': weather_context, 'route_context': route_context, 'processing_notes': notes}
 

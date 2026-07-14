@@ -127,7 +127,7 @@ def test_build_travel_plan_fallback_splits_route_and_destination_days(monkeypatc
     assert plan.raw_route['poi_candidates']['destination_candidates']
 
 
-def test_build_travel_plan_prefers_stage_sum_when_total_conflicts(monkeypatch):
+def test_build_travel_plan_keeps_explicit_total_when_stage_sum_conflicts(monkeypatch):
     monkeypatch.setattr(travel_planner.settings, 'tencent_maps_key', '')
     monkeypatch.setattr(travel_planner._client, 'key', '')
     request = TravelPlanRequest(
@@ -137,9 +137,9 @@ def test_build_travel_plan_prefers_stage_sum_when_total_conflicts(monkeypatch):
         source_query='总共三天，从济南自驾到成都，途中游玩三天，到成都游玩三天',
     )
     plan = travel_planner.build_travel_plan(request)
-    assert plan.duration_days == 6
-    assert len(plan.daily_itinerary) == 6
-    assert any('已按阶段天数重新计算' in note for note in plan.daily_itinerary[0].notes)
+    assert plan.duration_days == 3
+    assert len(plan.daily_itinerary) == 3
+    assert any('冲突' in note and '3天' in note for note in plan.daily_itinerary[0].notes)
 
 
 def test_build_stage_segments_for_stopover_then_destination():
@@ -152,8 +152,8 @@ def test_build_stage_segments_for_stopover_then_destination():
         'data_source': 'fallback',
         'stage_counts': {
             'total_days': 3,
-            'route_days': 2,
-            'destination_days': 1,
+            'route_days': 1,
+            'destination_days': 2,
             'buffer_days': 0,
             'stage_plan_mode': 'route_then_destination',
             'stage_notes': [],
@@ -165,6 +165,7 @@ def test_build_stage_segments_for_stopover_then_destination():
     assert [item['route_segment'] for item in segments] == ['济南 → 徐州', '徐州 → 杭州', '杭州市内/周边']
     assert segments[0]['anchor_city'] == '徐州'
     assert segments[1]['anchor_city'] == '杭州'
+    assert segments[1]['stage'] == 'destination'
     assert segments[2]['stage'] == 'destination'
     assert segments[2]['drive_minutes'] <= 60
 
@@ -189,6 +190,135 @@ def test_build_travel_plan_uses_stopover_stage_segments(monkeypatch):
     assert plan.daily_itinerary[-1].anchor_city == '杭州'
     assert '整体通行约' not in ' '.join(plan.daily_itinerary[-1].notes)
     assert not any('杭州目的地深度游' in day.title for day in plan.daily_itinerary[:2])
+
+
+def test_high_speed_rail_plan_uses_transport_block_instead_of_driving_copy(monkeypatch):
+    monkeypatch.setattr(travel_planner.settings, 'tencent_maps_key', '')
+    monkeypatch.setattr(travel_planner._client, 'key', '')
+    request = build_travel_request(
+        ChatRequest(question='帮我规划一个从济南到杭州三天两晚的旅行路线，要求乘坐高铁，在徐州游玩一天，剩余时间在杭州游玩，优先经典景点和合理游览节奏')
+    )
+
+    plan = travel_planner.build_travel_plan(request)
+
+    assert plan.raw_route['trip_profile']['intercity_mode'] == 'high_speed_rail'
+    assert plan.raw_route['trip_profile']['local_mode'] == 'mixed'
+    assert plan.raw_route['stage_segments'][0]['transport_block']['mode'] == 'high_speed_rail'
+    first_day_text = ' '.join([plan.daily_itinerary[0].morning, plan.daily_itinerary[0].evening, *plan.daily_itinerary[0].notes])
+    assert '高铁' in first_day_text
+    assert '进站候车' in first_day_text
+    assert '出站接驳' in first_day_text
+    assert '驾驶' not in first_day_text
+    assert any('高铁' in item for item in plan.transportation_suggestion)
+
+
+def test_explicit_three_day_trip_repeats_two_day_stopover_before_destination(monkeypatch):
+    monkeypatch.setattr(travel_planner.settings, 'tencent_maps_key', '')
+    monkeypatch.setattr(travel_planner._client, 'key', '')
+    captured: dict[str, object] = {}
+
+    def fake_weather_context(destination, route_stops=None, days=3, location_debug=None, daily_plan_context=None):
+        captured['days'] = days
+        captured['daily_plan_context'] = daily_plan_context
+        anchors = [str(item.get('anchor_city') or destination) for item in daily_plan_context or []]
+        return {
+            'data_source': 'tencent_maps',
+            'destination': destination,
+            'summary': '测试天气',
+            'daily_weather': [
+                {
+                    'day': index,
+                    'city': city,
+                    'weather': '多云',
+                    'temperature': '20-28℃',
+                    'strategy': '适合常规游览。',
+                    'weather_tips': [],
+                    'packing_tips': [],
+                    'weather_tags': [],
+                    'indoor_priority': False,
+                    'outdoor_suitability': 'good',
+                    'risk_level': 'low',
+                    'data_source': 'tencent_maps',
+                    'fallback_reason': None,
+                }
+                for index, city in enumerate(anchors, start=1)
+            ],
+            'warnings': [],
+            'request_debug': {'provider': 'test'},
+        }
+
+    monkeypatch.setattr(travel_planner, 'build_weather_context', fake_weather_context)
+    request = build_travel_request(
+        ChatRequest(question='帮我规划一个从杭州到济南三天两晚的旅行路线，要求乘坐高铁，在徐州游玩两天，剩余时间在济南游玩，优先经典景点和合理游览节奏')
+    )
+
+    plan = travel_planner.build_travel_plan(request)
+
+    assert plan.duration_days == 3
+    assert len(plan.daily_itinerary) == 3
+    assert [day.anchor_city for day in plan.daily_itinerary] == ['徐州', '徐州', '济南']
+    assert [day.stage for day in plan.daily_itinerary] == ['route', 'route', 'destination']
+    assert captured['days'] == 3
+    assert [item['anchor_city'] for item in captured['daily_plan_context']] == ['徐州', '徐州', '济南']
+    assert plan.raw_route['trip_profile']['duration_source'] == 'explicit_duration'
+    assert plan.raw_route['route_context']['stage_counts']['buffer_days'] == 0
+
+
+def test_weather_binding_rejects_same_day_weather_for_wrong_city():
+    day_context = {'day': 1, 'anchor_city': '徐州'}
+    weather_days = [
+        {'day': 1, 'city': '济南', 'weather': '晴', 'data_source': 'tencent_maps'},
+        {'day': 2, 'city': '徐州', 'weather': '小雨', 'data_source': 'tencent_maps'},
+    ]
+
+    assert travel_planner.find_weather_day_for_context(day_context, weather_days, 0) is None
+
+
+def test_weather_binding_uses_day_and_city_when_weather_array_is_unordered():
+    day_context = {'day': 2, 'anchor_city': '徐州'}
+    weather_days = [
+        {'day': 3, 'city': '济南', 'weather': '晴', 'data_source': 'tencent_maps'},
+        {'day': 2, 'city': '济南', 'weather': '多云', 'data_source': 'tencent_maps'},
+        {'day': 2, 'city': '徐州市', 'weather': '小雨', 'data_source': 'tencent_maps'},
+    ]
+
+    matched = travel_planner.find_weather_day_for_context(day_context, weather_days, 1)
+
+    assert matched is not None
+    assert matched['city'] == '徐州市'
+    assert matched['weather'] == '小雨'
+
+
+def test_weather_context_uses_daily_anchor_cities_when_fetching_weather(monkeypatch):
+    monkeypatch.setattr(travel_planner.settings, 'tencent_maps_key', '')
+    monkeypatch.setattr(travel_planner._client, 'key', '')
+    captured: dict[str, object] = {}
+
+    def fake_weather_context(destination, route_stops=None, days=3, location_debug=None, daily_plan_context=None):
+        captured['route_stops'] = route_stops
+        captured['daily_plan_context'] = daily_plan_context
+        return {
+            'data_source': 'fallback',
+            'destination': destination,
+            'summary': '天气待确认',
+            'daily_weather': [
+                {'day': 1, 'city': '徐州', 'weather': '天气待确认', 'temperature': '温度待确认', 'data_source': 'fallback'},
+                {'day': 2, 'city': '杭州', 'weather': '天气待确认', 'temperature': '温度待确认', 'data_source': 'fallback'},
+                {'day': 3, 'city': '杭州', 'weather': '天气待确认', 'temperature': '温度待确认', 'data_source': 'fallback'},
+            ],
+            'warnings': ['weather_fallback'],
+            'request_debug': {'provider': 'fallback', 'fallback_reason': 'test'},
+        }
+
+    monkeypatch.setattr(travel_planner, 'build_weather_context', fake_weather_context)
+    request = build_travel_request(ChatRequest(question='从济南自驾到杭州三天两晚，在徐州停留一天，剩余时间在杭州游玩'))
+
+    plan = travel_planner.build_travel_plan(request)
+
+    daily_context = captured['daily_plan_context']
+    assert isinstance(daily_context, list)
+    assert [item['anchor_city'] for item in daily_context] == ['徐州', '杭州', '杭州']
+    assert [day.anchor_city for day in plan.daily_itinerary] == ['徐州', '杭州', '杭州']
 
 
 def test_fallback_weather_does_not_claim_rain_or_heat_adaptation(monkeypatch):
@@ -250,6 +380,57 @@ def test_tencent_rain_weather_can_prioritize_indoor(monkeypatch):
     assert any('雨天优先室内' in reason for day in plan.daily_itinerary for reason in day.recommendation_reasons + day.notes)
 
 
+def test_rain_weather_reorders_candidate_pois_before_daily_selection(monkeypatch):
+    monkeypatch.setattr(travel_planner.settings, 'tencent_maps_key', '')
+    monkeypatch.setattr(travel_planner._client, 'key', '')
+
+    def fake_weather_context(destination, route_stops=None, days=3, location_debug=None, daily_plan_context=None):
+        cities = ['徐州', '杭州', '杭州']
+        return {
+            'data_source': 'tencent_maps',
+            'destination': destination,
+            'summary': '未来3天有降雨，优先室内景点。',
+            'daily_weather': [
+                {
+                    'day': index,
+                    'city': cities[index - 1],
+                    'weather': '阵雨',
+                    'temperature': '24-28℃',
+                    'outdoor_suitability': 'limited',
+                    'indoor_priority': True,
+                    'risk_level': 'medium',
+                    'strategy': '雨天优先室内，室外景点建议视天气压缩停留。',
+                    'weather_tags': ['rain'],
+                }
+                for index in range(1, days + 1)
+            ],
+            'warnings': [],
+            'request_debug': {'provider': 'tencent_maps', 'fallback_reason': None},
+        }
+
+    def fake_candidates_for_day(**kwargs):
+        anchor_city = kwargs.get('anchor_city') or '杭州'
+        outdoor_name = '云龙湖风景区' if anchor_city == '徐州' else '西湖风景名胜区'
+        return [
+            {'name': outdoor_name, 'category': '风景名胜;公园', 'address': f'{anchor_city}核心区', 'estimated_minutes': '120'},
+            {'name': f'{anchor_city}博物馆', 'category': '博物馆', 'address': f'{anchor_city}核心区', 'estimated_minutes': '150'},
+            {'name': f'{anchor_city}美术馆', 'category': '美术馆', 'address': f'{anchor_city}核心区', 'estimated_minutes': '120'},
+        ]
+
+    monkeypatch.setattr(travel_planner, 'build_weather_context', fake_weather_context)
+    monkeypatch.setattr(travel_planner, '_candidate_pois_for_day', fake_candidates_for_day)
+    request = build_travel_request(ChatRequest(question='从济南自驾到杭州三天两晚，在徐州停留一天，剩余时间在杭州游玩，喜欢公园和博物馆'))
+
+    plan = travel_planner.build_travel_plan(request)
+
+    first_name = plan.daily_itinerary[0].attractions[0]['name']
+    assert any(keyword in first_name for keyword in ('博物馆', '美术馆'))
+    assert '云龙湖' not in first_name
+    assert '西湖' not in first_name
+    first_day_text = ' '.join([plan.daily_itinerary[0].morning, *plan.daily_itinerary[0].recommendation_reasons])
+    assert '雨天优先室内' in first_day_text
+
+
 def test_tencent_rain_weather_is_visible_in_plan_summary_and_daily_fields(monkeypatch):
     monkeypatch.setattr(travel_planner.settings, 'tencent_maps_key', '')
     monkeypatch.setattr(travel_planner._client, 'key', '')
@@ -262,7 +443,7 @@ def test_tencent_rain_weather_is_visible_in_plan_summary_and_daily_fields(monkey
             'daily_weather': [
                 {
                     'day': index,
-                    'city': '杭州',
+                    'city': '徐州' if index == 1 else '杭州',
                     'weather': '阵雨',
                     'temperature': '22-28℃',
                     'outdoor_suitability': 'limited',
@@ -305,7 +486,7 @@ def test_tencent_heat_weather_moves_midday_to_rest_or_indoor(monkeypatch):
             'daily_weather': [
                 {
                     'day': index,
-                    'city': '杭州',
+                    'city': '徐州' if index == 1 else '杭州',
                     'weather': '晴',
                     'temperature': '30-36℃',
                     'outdoor_suitability': 'limited',
@@ -410,7 +591,7 @@ def test_tencent_weather_tips_are_added_to_daily_plan(monkeypatch):
             'daily_weather': [
                 {
                     'day': index,
-                    'city': '杭州',
+                    'city': '徐州' if index == 1 else '杭州',
                     'weather': '阵雨',
                     'temperature': '24-28℃',
                     'outdoor_suitability': 'limited',
@@ -449,7 +630,7 @@ def test_tencent_heat_weather_adds_sunscreen_tips_to_daily_plan(monkeypatch):
             'daily_weather': [
                 {
                     'day': index,
-                    'city': '杭州',
+                    'city': '徐州' if index == 1 else '杭州',
                     'weather': '晴',
                     'temperature': '30-36℃',
                     'outdoor_suitability': 'limited',
@@ -488,7 +669,7 @@ def test_fallback_weather_tips_stay_optional_not_deterministic(monkeypatch):
             'daily_weather': [
                 {
                     'day': index,
-                    'city': '杭州',
+                    'city': '徐州' if index == 1 else '杭州',
                     'weather': '天气待确认',
                     'temperature': '温度待确认',
                     'outdoor_suitability': 'unknown',
@@ -530,6 +711,83 @@ def test_fallback_weather_daily_plan_does_not_repeat_unconfirmed_copy(monkeypatc
     assert visible_weather_text.count('天气待确认') <= 1
     assert len(first_day.weather_adjustments) <= 1
     assert plan.raw_route['weather_context']['request_debug']['fallback_reason']
+
+
+def test_segmented_trip_day1_weather_uses_anchor_city_not_destination(monkeypatch):
+    monkeypatch.setattr(travel_planner.settings, 'tencent_maps_key', '')
+    monkeypatch.setattr(travel_planner._client, 'key', '')
+
+    def fake_weather_context(destination, route_stops=None, days=3, location_debug=None, daily_plan_context=None):
+        return {
+            'data_source': 'tencent_maps',
+            'destination': destination,
+            'summary': '分段天气测试',
+            'daily_weather': [
+                {
+                    'day': 2,
+                    'city': '西安',
+                    'weather': '多云',
+                    'temperature': '25-33℃',
+                    'data_source': 'tencent_maps',
+                    'fallback_reason': None,
+                    'weather_tags': [],
+                    'weather_tips': ['天气适合常规游览。'],
+                    'packing_tips': ['水杯'],
+                    'outdoor_suitability': 'good',
+                    'indoor_priority': False,
+                    'risk_level': 'low',
+                },
+                {
+                    'day': 1,
+                    'city': '徐州市',
+                    'weather': '阵雨',
+                    'temperature': '24-31℃',
+                    'data_source': 'tencent_maps',
+                    'fallback_reason': None,
+                    'weather_tags': ['rain'],
+                    'weather_tips': ['有降雨风险，优先室内或遮蔽点位。'],
+                    'packing_tips': ['雨伞'],
+                    'outdoor_suitability': 'limited',
+                    'indoor_priority': True,
+                    'risk_level': 'medium',
+                },
+                {
+                    'day': 3,
+                    'city': '西安',
+                    'weather': '晴',
+                    'temperature': '26-34℃',
+                    'data_source': 'tencent_maps',
+                    'fallback_reason': None,
+                    'weather_tags': ['sun_exposure'],
+                    'weather_tips': ['注意防晒、补水。'],
+                    'packing_tips': ['防晒霜'],
+                    'outdoor_suitability': 'good',
+                    'indoor_priority': False,
+                    'risk_level': 'low',
+                },
+            ],
+            'warnings': [],
+            'request_debug': {
+                'provider': 'tencent_maps',
+                'fallback_reason': None,
+                'weather_targets': [
+                    {'day': 1, 'city': '徐州', 'adcode': '320300', 'data_source': 'tencent_maps'},
+                    {'day': 2, 'city': '西安', 'adcode': '610100', 'data_source': 'tencent_maps'},
+                    {'day': 3, 'city': '西安', 'adcode': '610100', 'data_source': 'tencent_maps'},
+                ],
+            },
+        }
+
+    monkeypatch.setattr(travel_planner, 'build_weather_context', fake_weather_context)
+
+    request = build_travel_request(ChatRequest(question='帮我规划一个从杭州到西安三天两晚的旅行路线，要求乘坐高铁，在徐州游玩一天，剩余时间在西安游玩'))
+    plan = travel_planner.build_travel_plan(request)
+
+    first_day = plan.daily_itinerary[0]
+    assert first_day.anchor_city == '徐州'
+    assert first_day.weather_badge != '天气待确认'
+    assert '徐州' in first_day.weather_summary
+    assert '阵雨' in first_day.weather_summary
 
 
 def test_daily_notes_do_not_duplicate_meals_hotels_or_reasons(monkeypatch):

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import inspect
 from typing import Any
 from uuid import uuid4
 
@@ -26,6 +28,7 @@ from travel_agent.services.poi_candidate_service import (
     is_valid_attraction_poi,
 )
 from travel_agent.services.route_stop_service import infer_route_stops
+from travel_agent.services.transport_mode_service import estimate_intercity_transport_block, transport_mode_label
 from travel_agent.services.trip_profile_service import build_trip_profile, decide_trip_type, score_poi
 from travel_agent.services.weather_service import (
     build_daily_weather_adjustments,
@@ -41,6 +44,16 @@ settings = get_settings()
 logger = get_logger(__name__)
 memory_store = RedisMemoryStore()
 _client = TencentWebServiceClient()
+_BACKEND_STARTED_AT = datetime.now(timezone.utc).isoformat()
+_WEATHER_PIPELINE_VERSION = 'daily-city-v2'
+
+
+def _response_debug_metadata() -> dict[str, str]:
+    return {
+        'generated_at': datetime.now(timezone.utc).isoformat(),
+        'backend_started_at': _BACKEND_STARTED_AT,
+        'weather_pipeline_version': _WEATHER_PIPELINE_VERSION,
+    }
 
 
 class TencentMapsError(RuntimeError):
@@ -818,14 +831,22 @@ def _resolve_stage_counts(profile: dict[str, Any]) -> dict[str, Any]:
         total_days = explicit_total
         notes.append(f'用户明确总共{explicit_total}天，阶段合计{stage_sum}天，已保留{explicit_total - stage_sum}天作为机动/返程缓冲。')
     elif explicit_total is not None and explicit_total < stage_sum:
-        notes.append(f'用户明确总共{explicit_total}天，但阶段拆分合计{stage_sum}天，已按阶段天数重新计算。')
-        total_days = stage_sum
+        original_route_days = route_days
+        original_destination_days = destination_days
+        total_days = explicit_total
+        route_days = min(route_days, total_days)
+        destination_days = min(destination_days, max(0, total_days - route_days))
+        notes.append(
+            f'明确总时长{explicit_total}天与阶段拆分{original_route_days}+{original_destination_days}天冲突，'
+            f'已保留明确总时长并压缩为途中{route_days}天、目的地{destination_days}天。'
+        )
     elif stage_sum > total_days:
         notes.append(f'阶段拆分合计{stage_sum}天超过原始总天数{total_days}天，已按阶段天数重新计算。')
         total_days = stage_sum
     elif stage_sum and stage_sum < total_days:
         notes.append(f'阶段拆分合计{stage_sum}天，剩余{total_days - stage_sum}天作为机动/返程缓冲。')
 
+    stage_sum = route_days + destination_days
     buffer_days = max(0, total_days - stage_sum)
     if route_days > 0 and destination_days > 0:
         stage_mode = 'route_then_destination'
@@ -851,6 +872,73 @@ def _segment_visit_minutes(profile: dict[str, Any], drive_minutes: int) -> int:
     return max(90, _activity_minutes_for_profile(profile) - max(0, drive_minutes))
 
 
+def _estimate_segment_distances(total_meters: int, count: int) -> list[int]:
+    if count <= 0:
+        return []
+    if total_meters <= 0:
+        return [0 for _ in range(count)]
+    base = max(0, total_meters // count)
+    distances = [base for _ in range(count)]
+    distances[-1] += max(0, total_meters - base * count)
+    return distances
+
+
+def _intercity_mode_for_profile(profile: dict[str, Any], request: TravelPlanRequest) -> str:
+    mode = str(profile.get('intercity_mode') or '').strip()
+    if mode:
+        return mode
+    if request.travel_mode in {'driving', 'transit'}:
+        return request.travel_mode
+    return 'driving'
+
+
+def _transport_block_for_segment(
+    *,
+    request: TravelPlanRequest,
+    profile: dict[str, Any],
+    origin: str,
+    destination: str,
+    distance_meters: int,
+    drive_minutes: int,
+) -> dict[str, Any]:
+    intercity_mode = _intercity_mode_for_profile(profile, request)
+    return estimate_intercity_transport_block(
+        origin=origin,
+        destination=destination,
+        mode=intercity_mode,
+        distance_meters=distance_meters,
+        fallback_minutes=drive_minutes,
+    )
+
+
+def _supports_keyword(func: Any, keyword: str) -> bool:
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return False
+    if keyword in signature.parameters:
+        return True
+    return any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values())
+
+
+def _build_weather_context_for_plan(
+    *,
+    destination: str,
+    route_stops: list[dict[str, Any]],
+    days: int,
+    location_debug: dict[str, Any],
+    daily_plan_context: list[dict[str, Any]],
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        'route_stops': route_stops,
+        'days': days,
+        'location_debug': location_debug,
+    }
+    if _supports_keyword(build_weather_context, 'daily_plan_context'):
+        kwargs['daily_plan_context'] = daily_plan_context
+    return build_weather_context(destination, **kwargs)
+
+
 def _route_stops_for_segments(request: TravelPlanRequest, profile: dict[str, Any], route_context: dict[str, Any], route_days: int, destination_days: int) -> list[dict[str, Any]]:
     existing = route_context.get('route_stops') if isinstance(route_context.get('route_stops'), list) else None
     if existing:
@@ -870,61 +958,128 @@ def build_stage_segments(request: TravelPlanRequest, profile: dict[str, Any], ro
     route_stops = _route_stops_for_segments(request, profile, route_context, route_days, destination_days)
     route_stops = sorted(route_stops, key=lambda item: int(item.get('stage_day') or item.get('preferred_day') or 999))
     route_targets: list[dict[str, Any]] = []
-    if route_days > 0:
-        intermediate_slots = max(0, route_days - 1) if destination_days > 0 else route_days
-        route_targets.extend(route_stops[:intermediate_slots])
-        needs_destination_transition = destination_days > 0 or not route_targets or _clean_city(str(route_targets[-1].get('name') or '')) != _clean_city(request.destination)
-        if needs_destination_transition and len(route_targets) < route_days:
-            route_targets.append({'name': request.destination, 'type': 'destination_transition', 'stage_day': len(route_targets) + 1, 'stay_days': 0, 'stay_nights': 0, 'data_source': 'destination_transition'})
-        while len(route_targets) < route_days:
-            route_targets.append({'name': request.destination, 'type': 'destination_transition', 'stage_day': len(route_targets) + 1, 'stay_days': 0, 'stay_nights': 0, 'data_source': 'destination_transition'})
+    for stop in route_stops:
+        try:
+            stay_amount = float(stop.get('stay_days') or stop.get('stay_nights') or 0)
+        except (TypeError, ValueError):
+            stay_amount = 0
+        repeat_count = max(1, int(stay_amount) if stay_amount.is_integer() else int(stay_amount) + 1)
+        for repeat_index in range(repeat_count):
+            route_targets.append({**stop, 'stage_day': len(route_targets) + 1, 'local_stay_day': repeat_index > 0})
+            if len(route_targets) >= route_days:
+                break
+        if len(route_targets) >= route_days:
+            break
+    while len(route_targets) < route_days:
+        if route_targets:
+            route_targets.append({**route_targets[-1], 'stage_day': len(route_targets) + 1, 'local_stay_day': True})
+        else:
+            route_targets.append({'name': request.destination, 'type': 'destination_fallback', 'stage_day': len(route_targets) + 1, 'stay_days': 1, 'stay_nights': 0, 'data_source': 'destination_fallback'})
     total_minutes = int(route_context.get('route_total_duration_minutes') or 0)
+    total_meters = int(route_context.get('route_total_distance_meters') or 0)
     drive_segments = _estimate_drive_segments(total_minutes, max(1, len(route_targets))) if route_targets else []
+    distance_segments = _estimate_segment_distances(total_meters, max(1, len(route_targets))) if route_targets else []
     segment_source = 'tencent_maps' if route_context.get('data_source') == 'tencent_maps' and len(route_targets) <= 1 else 'fallback_estimated'
     segments: list[dict[str, Any]] = []
     current_origin = request.origin
     for index, target in enumerate(route_targets, start=1):
         target_name = str(target.get('name') or request.destination)
         drive_minutes = drive_segments[index - 1] if index - 1 < len(drive_segments) else 0
-        pair_estimate = _FALLBACK_INTERCITY_ESTIMATES.get((_clean_city(current_origin), _clean_city(target_name)))
-        if segment_source == 'fallback_estimated' and pair_estimate:
-            drive_minutes = pair_estimate[1]
-        stage = 'destination_transition' if _clean_city(target_name) == _clean_city(request.destination) and destination_days > 0 else 'route'
+        segment_distance = distance_segments[index - 1] if index - 1 < len(distance_segments) else 0
+        is_local_day = _clean_city(current_origin) == _clean_city(target_name)
+        if is_local_day:
+            drive_minutes = 35
+            segment_distance = 0
+            local_mode = str(profile.get('local_mode') or request.travel_mode)
+            transport_block = {
+                'mode': local_mode,
+                'label': transport_mode_label(local_mode, local=True),
+                'origin': target_name,
+                'destination': target_name,
+                'total_minutes': drive_minutes,
+                'summary': f'市内转场约{_format_duration_minutes(drive_minutes)}',
+            }
+            route_segment = f'{target_name}市内/周边'
+        else:
+            pair_estimate = _FALLBACK_INTERCITY_ESTIMATES.get((_clean_city(current_origin), _clean_city(target_name)))
+            if segment_source == 'fallback_estimated' and pair_estimate:
+                segment_distance = pair_estimate[0]
+                drive_minutes = pair_estimate[1]
+            transport_block = _transport_block_for_segment(
+                request=request,
+                profile=profile,
+                origin=current_origin,
+                destination=target_name,
+                distance_meters=segment_distance,
+                drive_minutes=drive_minutes,
+            )
+            route_segment = f'{current_origin} → {target_name}'
+        transfer_minutes = int(transport_block.get('total_minutes') or drive_minutes)
         segments.append(
             {
                 'day': index,
                 'stage': 'route',
-                'stage_label': stage,
+                'stage_label': 'route',
                 'origin': current_origin,
                 'destination': target_name,
                 'anchor_city': target_name,
-                'route_segment': f'{current_origin} → {target_name}',
-                'planned_stay_days': target.get('stay_days', 0),
+                'route_segment': route_segment,
+                'planned_stay_days': 1,
                 'planned_stay_nights': target.get('stay_nights', 0),
-                'drive_minutes': drive_minutes,
-                'visit_minutes': _segment_visit_minutes(profile, drive_minutes),
+                'drive_minutes': transfer_minutes,
+                'transport_minutes': transfer_minutes,
+                'visit_minutes': _segment_visit_minutes(profile, transfer_minutes),
+                'transport_block': transport_block,
                 'data_source': segment_source,
             }
         )
         current_origin = target_name
     for day in range(route_days + 1, route_days + destination_days + 1):
-        drive_minutes = 45 if day == route_days + 1 else 30
+        is_destination_transition = _clean_city(current_origin) != _clean_city(request.destination)
+        if is_destination_transition:
+            pair_estimate = _FALLBACK_INTERCITY_ESTIMATES.get((_clean_city(current_origin), _clean_city(request.destination)))
+            segment_distance, drive_minutes = pair_estimate or (max(0, total_meters), max(120, total_minutes))
+            transport_block = _transport_block_for_segment(
+                request=request,
+                profile=profile,
+                origin=current_origin,
+                destination=request.destination,
+                distance_meters=segment_distance,
+                drive_minutes=drive_minutes,
+            )
+            drive_minutes = int(transport_block.get('total_minutes') or drive_minutes)
+            route_segment = f'{current_origin} → {request.destination}'
+        else:
+            drive_minutes = 45 if day == route_days + 1 else 30
+            local_mode = str(profile.get('local_mode') or request.travel_mode)
+            transport_block = {
+                'mode': local_mode,
+                'label': transport_mode_label(local_mode, local=True),
+                'origin': request.destination,
+                'destination': request.destination,
+                'total_minutes': drive_minutes,
+                'summary': f'市内转场约{_format_duration_minutes(drive_minutes)}',
+            }
+            route_segment = f'{request.destination}市内/周边'
         segments.append(
             {
                 'day': day,
                 'stage': 'destination',
                 'stage_label': 'destination',
-                'origin': request.destination,
+                'origin': current_origin,
                 'destination': request.destination,
                 'anchor_city': request.destination,
-                'route_segment': f'{request.destination}市内/周边',
+                'route_segment': route_segment,
                 'planned_stay_days': 1,
                 'planned_stay_nights': 0,
                 'drive_minutes': drive_minutes,
+                'transport_minutes': drive_minutes,
                 'visit_minutes': _segment_visit_minutes(profile, drive_minutes),
+                'transport_block': transport_block,
                 'data_source': 'fallback_estimated',
             }
         )
+        current_origin = request.destination
     for day in range(route_days + destination_days + 1, total_days + 1):
         segments.append(
             {
@@ -938,7 +1093,16 @@ def build_stage_segments(request: TravelPlanRequest, profile: dict[str, Any], ro
                 'planned_stay_days': 0,
                 'planned_stay_nights': 0,
                 'drive_minutes': 60,
+                'transport_minutes': 60,
                 'visit_minutes': _segment_visit_minutes(profile, 60),
+                'transport_block': {
+                    'mode': str(profile.get('local_mode') or request.travel_mode),
+                    'label': transport_mode_label(str(profile.get('local_mode') or request.travel_mode), local=True),
+                    'origin': request.destination,
+                    'destination': request.destination,
+                    'total_minutes': 60,
+                    'summary': '机动/返程缓冲约1小时',
+                },
                 'data_source': 'fallback_estimated',
             }
         )
@@ -1025,9 +1189,13 @@ def _build_route_context(request: TravelPlanRequest, best_option: RouteOption, p
         item['route_segment'] = segment.get('route_segment')
         item['segment_data_source'] = segment.get('data_source')
         item['daily_drive_minutes'] = int(segment.get('drive_minutes') or item.get('daily_drive_minutes') or 0)
+        item['transport_minutes'] = int(segment.get('transport_minutes') or item.get('daily_drive_minutes') or 0)
+        item['transport_block'] = segment.get('transport_block')
         item['daily_available_visit_minutes'] = int(segment.get('visit_minutes') or item.get('daily_available_visit_minutes') or 0)
         if item['stage'] == 'destination':
             item['recommended_spots'] = 3 if item['daily_available_visit_minutes'] >= 300 else 2
+        elif isinstance(item.get('transport_block'), dict) and item['transport_block'].get('mode') not in {'driving', None} and item['daily_drive_minutes'] >= 240:
+            item['recommended_spots'] = 1 if item['daily_drive_minutes'] > 300 else 2
         elif request.travel_mode == 'driving' and item['daily_drive_minutes'] > 300:
             item['recommended_spots'] = 1
         elif request.travel_mode == 'driving' and item['daily_drive_minutes'] >= 120:
@@ -1104,11 +1272,17 @@ def _extract_trip_profile(request: TravelPlanRequest) -> dict[str, Any]:
         'route_stops': base_profile.get('route_stops', []),
         'destination_stay_days': base_profile.get('destination_stay_days'),
         'total_days_source': base_profile.get('total_days_source'),
+        'duration_source': base_profile.get('duration_source'),
         'stage_plan_mode': base_profile.get('stage_plan_mode'),
         'explicit_total_days': base_profile.get('explicit_total_days'),
         'waypoint_details': base_profile.get('waypoint_details', []),
         'must_visit_attractions': base_profile.get('must_visit_attractions', []),
         'waypoint_order_mode': base_profile.get('waypoint_order_mode', 'unspecified'),
+        'intercity_mode': base_profile.get('intercity_mode') or request.travel_mode,
+        'intercity_label': base_profile.get('intercity_label') or transport_mode_label(base_profile.get('intercity_mode') or request.travel_mode),
+        'local_mode': base_profile.get('local_mode') or request.travel_mode,
+        'local_label': base_profile.get('local_label') or transport_mode_label(base_profile.get('local_mode') or request.travel_mode, local=True),
+        'transport_preference_source': base_profile.get('transport_preference_source') or 'default',
         'source_text': source_text,
     }
 
@@ -1322,14 +1496,23 @@ def _build_transportation_suggestions(request: TravelPlanRequest, best_option: R
     distance_value = _get_route_numeric_value(best_option.distance) or 0
     duration_value = _get_route_numeric_value(best_option.duration) or 0
     suggestions: list[str] = []
+    profile = request.trip_profile if isinstance(request.trip_profile, dict) else {}
+    intercity_mode = str(profile.get('intercity_mode') or request.travel_mode)
+    local_mode = str(profile.get('local_mode') or request.travel_mode)
+    intercity_label = transport_mode_label(intercity_mode)
+    local_label = transport_mode_label(local_mode, local=True)
     mode_labels = {
         'driving': '驾车',
         'walking': '步行',
         'transit': '公共交通',
         'bicycling': '骑行',
     }
-    suggestions.append(f'当前推荐以{mode_labels.get(request.travel_mode, request.travel_mode)}为主，预计 {best_option.duration} / {best_option.distance}。')
-    if request.travel_mode == 'driving':
+    if intercity_mode in {'high_speed_rail', 'train', 'flight', 'coach'}:
+        suggestions.append(f'跨城段建议以{intercity_label}为主，市内采用{local_label}接驳；跨城时间需额外预留进站候车、出站接驳和行李整理。')
+        suggestions.append('高铁/火车/航班班次以购票平台为准，建议把固定票务时间作为当天上午或下午的硬约束。')
+    else:
+        suggestions.append(f'当前推荐以{mode_labels.get(request.travel_mode, request.travel_mode)}为主，预计 {best_option.duration} / {best_option.distance}。')
+    if intercity_mode == 'driving' or (request.travel_mode == 'driving' and intercity_mode not in {'high_speed_rail', 'train', 'flight', 'coach'}):
         if distance_value >= 200:
             suggestions.append('路程较长，建议中途安排服务区休息，并提前确认高速费与拥堵情况。')
         else:
@@ -1924,6 +2107,30 @@ def _search_hotels_for_poi(city: str, poi: dict[str, str] | None) -> list[dict[s
     return deduped[:8]
 
 
+def _normalize_weather_city(value: Any) -> str:
+    return re.sub(r'\s+', '', str(value or '')).replace('市', '')
+
+
+def find_weather_day_for_context(day_context: dict[str, Any], daily_weather: Any, fallback_index: int) -> dict[str, Any] | None:
+    if not isinstance(daily_weather, list):
+        return None
+    weather_days = [item for item in daily_weather if isinstance(item, dict)]
+    day = int(day_context.get('day') or fallback_index + 1)
+    anchor_city = _normalize_weather_city(day_context.get('anchor_city') or day_context.get('destination') or '')
+    if anchor_city:
+        for item in weather_days:
+            if int(item.get('day') or 0) == day and _normalize_weather_city(item.get('city')) == anchor_city:
+                return item
+        for item in weather_days:
+            if int(item.get('day') or 0) == day and not _normalize_weather_city(item.get('city')):
+                return item
+        return None
+    for item in weather_days:
+        if int(item.get('day') or 0) == day:
+            return item
+    return None
+
+
 
 def _build_trip_itinerary(
     request: TravelPlanRequest,
@@ -1976,7 +2183,7 @@ def _build_trip_itinerary(
         else:
             pace_note = '节奏为常规游览强度，建议把核心景点放在上午与下午前段完成。'
         day_context = next((item for item in route_context.get('daily_plan_context', []) if item.get('day') == day), {})
-        weather_day = daily_weather[day - 1] if isinstance(daily_weather, list) and day - 1 < len(daily_weather) and isinstance(daily_weather[day - 1], dict) else None
+        weather_day = find_weather_day_for_context(day_context, daily_weather, day - 1)
         stage = str(day_context.get('stage') or 'destination')
         stage_day = int(day_context.get('stage_day') or day)
         drive_today = int(day_context.get('daily_drive_minutes') or 0)
@@ -1985,6 +2192,7 @@ def _build_trip_itinerary(
         anchor_city = str(day_context.get('anchor_city') or destination)
         route_segment = str(day_context.get('route_segment') or '')
         segment_data_source = str(day_context.get('segment_data_source') or 'fallback_estimated')
+        transport_block = day_context.get('transport_block') if isinstance(day_context.get('transport_block'), dict) else None
         if stage == 'buffer':
             recommended_spots = min(recommended_spots, 1)
         effective_weather = _effective_weather_day(weather_context, weather_day)
@@ -2004,6 +2212,13 @@ def _build_trip_itinerary(
             used_attractions=used_attractions,
         )
         candidate_pois = day_candidate_pois or base_attraction_pois
+        if effective_weather:
+            weather_score_context = {**route_context, **day_context, 'stage': stage, 'weather_day': effective_weather}
+            candidate_pois = sorted(
+                candidate_pois,
+                key=lambda item: float(score_poi(dict(item), profile, weather_score_context).get('final_score') or 0),
+                reverse=True,
+            )
         used_buckets_by_day: set[str] = set()
         selected_pois = select_unique_day_pois(
             anchor_city=anchor_city,
@@ -2071,7 +2286,47 @@ def _build_trip_itinerary(
             stage_note = f'目的地阶段：以{anchor_city}市内或近距离周边景点游览为主，避免继续使用跨城全程骨架。'
             route_segment = route_segment or f'{anchor_city}市内/周边'
 
-        if stage == 'route' and request.travel_mode == 'driving' and drive_today >= 180:
+        transport_mode = str((transport_block or {}).get('mode') or profile.get('intercity_mode') or request.travel_mode)
+        transport_label = str((transport_block or {}).get('label') or transport_mode_label(transport_mode))
+        transport_summary = str((transport_block or {}).get('summary') or '')
+        if stage == 'route' and transport_mode not in {'driving', 'walking', 'bicycling'} and drive_today >= 120:
+            transfer_start_hour, transfer_start_minute = 8, 0
+            transfer_end_hour, transfer_end_minute = _shift_minutes(transfer_start_hour, transfer_start_minute, drive_today)
+            transport_phrase = transport_summary or f'{transport_label}跨城转场约{_format_duration_minutes(drive_today)}'
+            if morning_poi:
+                morning_end_hour, morning_end_minute = _shift_minutes(transfer_end_hour, transfer_end_minute, morning_duration)
+                morning = (
+                    f'{_format_time(transfer_start_hour, transfer_start_minute)}-{_format_time(morning_end_hour, morning_end_minute)} '
+                    f'先完成{transport_label}跨城抵达，{transport_phrase}；到达后出站接驳至 {morning_name}{f"（{morning_addr}）" if morning_addr else ""}，'
+                    f'建议停留 {_format_duration_minutes(morning_duration)}，{morning_note}。'
+                )
+            else:
+                morning_end_hour, morning_end_minute = _shift_minutes(transfer_end_hour, transfer_end_minute, 90)
+                morning = (
+                    f'{_format_time(transfer_start_hour, transfer_start_minute)}-{_format_time(morning_end_hour, morning_end_minute)} '
+                    f'先完成{transport_label}跨城抵达，{transport_phrase}；抵达{anchor_city}后办理出站接驳、补给或入住，保留轻量休整。'
+                )
+            if afternoon_poi:
+                afternoon_start_hour, afternoon_start_minute = _shift_minutes(morning_end_hour, morning_end_minute, transfer_1 + 40)
+                afternoon_end_hour, afternoon_end_minute = _shift_minutes(afternoon_start_hour, afternoon_start_minute, afternoon_duration)
+                afternoon = (
+                    f'{_format_time(afternoon_start_hour, afternoon_start_minute)}-{_format_time(afternoon_end_hour, afternoon_end_minute)} '
+                    f'前往 {afternoon_name}{f"（{afternoon_addr}）" if afternoon_addr else ""}，建议停留 {_format_duration_minutes(afternoon_duration)}；'
+                    f'该段重点考虑与车站/上午景点的衔接效率。{move_1_text}'
+                )
+            else:
+                afternoon_end_hour, afternoon_end_minute = _shift_minutes(morning_end_hour, morning_end_minute, 150)
+                afternoon = f'下午保留为抵达、入住或休整时间，可在{anchor_city}核心区轻量散步，不强行增加景点。'
+            if evening_poi:
+                evening_start_hour, evening_start_minute = _shift_minutes(afternoon_end_hour, afternoon_end_minute, transfer_2 + 20)
+                evening_end_hour, evening_end_minute = _shift_minutes(evening_start_hour, evening_start_minute, min(evening_duration, 120))
+                evening = (
+                    f'{_format_time(evening_start_hour, evening_start_minute)}-{_format_time(evening_end_hour, evening_end_minute)} '
+                    f'视体力补充 {evening_name}{f"（{evening_addr}）" if evening_addr else ""}，建议停留 {_format_duration_minutes(min(evening_duration, 120))}；{evening_note}。{move_2_text}'
+                )
+            else:
+                evening = '晚间以就近用餐和休息为主，避免长距离换乘后的疲劳。'
+        elif stage == 'route' and request.travel_mode == 'driving' and drive_today >= 180:
             drive_start_hour, drive_start_minute = 8, 0
             drive_end_hour, drive_end_minute = _shift_minutes(drive_start_hour, drive_start_minute, drive_today)
             if morning_poi:
@@ -2166,7 +2421,9 @@ def _build_trip_itinerary(
                 afternoon = f'中午安排室内景点、午餐或休整，避开正午户外暴晒；{afternoon}'
             if '补水' not in evening:
                 evening = f'傍晚再补充户外点位并注意补水；{evening}'
-        weather_data_source = str((weather_day or {}).get('data_source') or weather_context.get('data_source') or 'fallback')
+        weather_data_source = str(
+            ((weather_day or {}).get('data_source') or weather_context.get('data_source') or 'fallback') if weather_day else 'fallback'
+        )
         fallback_weather_note = ''
         if weather_data_source != 'tencent_maps':
             weather_strategy = ''
@@ -2207,6 +2464,10 @@ def _build_trip_itinerary(
             transfer_note = f'景点转场参考：两个景点之间约预留 {transfer_1 or 30} 分钟，优先减少折返。'
         else:
             transfer_note = '景点转场参考：当天景点较少，优先减少折返并保留体力。'
+        if transport_block and transport_mode not in {'driving', 'walking', 'bicycling'}:
+            route_time_note = f'当日路线段：{route_segment}，{transport_summary or f"{transport_label}跨城转场约{_format_duration_minutes(drive_today)}"}。'
+        else:
+            route_time_note = f'当日路线段：{route_segment}，{"预计" if segment_data_source != "tencent_maps" else "腾讯地图"}行驶/转场约{_format_duration_minutes(drive_today)}。'
         notes = [
             stage_note,
             pace_note,
@@ -2216,7 +2477,7 @@ def _build_trip_itinerary(
             *daily_weather_adjustments,
             visit_note,
             transfer_note,
-            f'当日路线段：{route_segment}，{"预计" if segment_data_source != "tencent_maps" else "腾讯地图"}行驶/转场约{_format_duration_minutes(drive_today)}。',
+            route_time_note,
             f'当天包含用户指定途经点/必去景点：{"、".join(required_today)}。' if required_today else '',
             *stage_notes,
         ]
@@ -2245,6 +2506,7 @@ def _build_trip_itinerary(
                 weather_tips=weather_tips,
                 packing_tips=packing_tips,
                 weather_tags=weather_tags,
+                transport_block=transport_block,
                 morning=morning,
                 afternoon=afternoon,
                 evening=evening,
@@ -2434,6 +2696,8 @@ def compose_travel_plan(
                 'buffer_days': profile.get('buffer_days'),
                 'stage_plan_mode': profile.get('stage_plan_mode'),
                 'stage_notes': profile.get('stage_notes', []),
+                'duration_source': profile.get('duration_source'),
+                **_response_debug_metadata(),
             },
             'location_debug': location_debug,
             'stage_segments': route_context.get('stage_segments', []),
@@ -2485,11 +2749,12 @@ def build_travel_plan(request: TravelPlanRequest, memory_store_override: RedisMe
     origin_point = location_debug.get('origin_point')
     weather_hint = _fetch_weather_hint(request.destination, destination_point)
     poi_candidates = fetch_poi_candidates(request, profile, route_context, location_debug)
-    weather_context = build_weather_context(
-        request.destination,
+    weather_context = _build_weather_context_for_plan(
+        destination=request.destination,
         route_stops=poi_candidates.get('route_stops', []),
         days=int(profile.get('duration_days') or 3),
         location_debug=location_debug,
+        daily_plan_context=route_context.get('daily_plan_context', []),
     )
     route_context['weather_context'] = weather_context
     weather_hint = _weather_hint_from_context(request.destination, weather_context, weather_hint)
@@ -2596,6 +2861,8 @@ def build_travel_plan(request: TravelPlanRequest, memory_store_override: RedisMe
                 'buffer_days': profile.get('buffer_days'),
                 'stage_plan_mode': profile.get('stage_plan_mode'),
                 'stage_notes': profile.get('stage_notes', []),
+                'duration_source': profile.get('duration_source'),
+                **_response_debug_metadata(),
             },
             'location_debug': location_debug,
             'stage_segments': route_context.get('stage_segments', []),

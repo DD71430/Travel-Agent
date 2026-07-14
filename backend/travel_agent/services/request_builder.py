@@ -13,17 +13,28 @@ from travel_agent.services.intent_service import (
     extract_trip_details,
     extract_weather_preferences,
 )
+from travel_agent.services.transport_mode_service import parse_transport_modes
 from travel_agent.services.trip_profile_service import build_trip_profile_from_text
 from travel_agent.services.waypoint_service import extract_must_visit_attractions, extract_waypoint_details, extract_waypoint_order_mode
 
 
-def build_preference_summary(question: str, existing_preferences: str | None, travel_mode: str, trip_details: dict[str, str | None]) -> str:
+def build_preference_summary(
+    question: str,
+    existing_preferences: str | None,
+    travel_mode: str,
+    trip_details: dict[str, str | None],
+    transport_modes: dict[str, str] | None = None,
+    duration_source: str | None = None,
+) -> str:
     parts: list[str] = []
     mode_labels = {'driving': '自驾/驾车', 'walking': '步行', 'transit': '公共交通', 'bicycling': '骑行'}
     parts.append(f'出行方式：{mode_labels.get(travel_mode, travel_mode)}')
+    if transport_modes:
+        parts.append(f'跨城交通：{transport_modes.get("intercity_label") or transport_modes.get("intercity_mode")}')
+        parts.append(f'市内交通：{transport_modes.get("local_label") or transport_modes.get("local_mode")}')
     if trip_details.get('budget'):
         parts.append(f'预算：{trip_details["budget"]}元')
-    if trip_details.get('duration_days'):
+    if trip_details.get('duration_days') and duration_source in {'explicit_duration', 'explicit_total'}:
         parts.append(f'行程时长：{trip_details["duration_days"]}天')
     if trip_details.get('nights'):
         parts.append(f'住宿节奏：{trip_details["nights"]}晚')
@@ -75,7 +86,11 @@ def parse_waypoints(raw: str | None) -> list[dict[str, object]]:
 def build_travel_request(request: ChatRequest) -> TravelPlanRequest:
     parsed_origin, parsed_destination = extract_locations(request.question)
     trip_details = extract_trip_details(request.question)
-    travel_mode = extract_travel_mode(request.question, request.travel_mode)
+    question_text = request.question or ''
+    preference_text = (request.preferences or '').strip()
+    initial_travel_mode = extract_travel_mode(request.question, request.travel_mode)
+    transport_modes = parse_transport_modes(f'{question_text} {preference_text}', fallback_travel_mode=initial_travel_mode)
+    travel_mode = transport_modes['travel_mode']
     if request.origin or request.destination:
         origin = (request.origin or parsed_origin or '起点').strip()
         destination = (request.destination or parsed_destination or '终点').strip()
@@ -86,10 +101,6 @@ def build_travel_request(request: ChatRequest) -> TravelPlanRequest:
         origin = parsed_origin or '起点'
         destination = parsed_destination or '终点'
     source_query = request.question
-    if parsed_origin and parsed_destination:
-        source_query = f'{parsed_origin}到{parsed_destination} | 天数:{trip_details["duration_days"] or "未知"} | 预算:{trip_details["budget"] or "未知"} | 原始输入:{request.question}'
-    preference_text = (request.preferences or '').strip()
-    question_text = request.question or ''
     merged_preference_text = '；'.join(part for part in [preference_text, question_text] if part)
     parsed_profile = build_trip_profile_from_text(merged_preference_text, origin=origin, destination=destination, travel_mode=travel_mode)
     waypoint_details = extract_waypoint_details(question_text)
@@ -113,11 +124,17 @@ def build_travel_request(request: ChatRequest) -> TravelPlanRequest:
         'route_stops': parsed_profile.get('route_stops', []),
         'destination_stay_days': parsed_profile.get('destination_stay_days'),
         'total_days_source': parsed_profile.get('total_days_source'),
+        'duration_source': parsed_profile.get('duration_source'),
         'stage_plan_mode': parsed_profile.get('stage_plan_mode'),
         'explicit_total_days': parsed_profile.get('explicit_total_days'),
         'waypoint_details': waypoint_details,
         'must_visit_attractions': must_visit_attractions,
         'waypoint_order_mode': waypoint_order_mode,
+        'intercity_mode': transport_modes['intercity_mode'],
+        'intercity_label': transport_modes['intercity_label'],
+        'local_mode': transport_modes['local_mode'],
+        'local_label': transport_modes['local_label'],
+        'transport_preference_source': transport_modes['transport_preference_source'],
     }
     merged_waypoints: list[dict[str, object]] = []
     for item in [*parse_waypoints(request.waypoints_json), *extract_question_waypoints(question_text), *waypoint_details]:
@@ -143,7 +160,14 @@ def build_travel_request(request: ChatRequest) -> TravelPlanRequest:
         origin=origin,
         destination=destination,
         travel_mode=travel_mode,  # type: ignore[arg-type]
-        preferences=build_preference_summary(question_text, preference_text, travel_mode, trip_details),
+        preferences=build_preference_summary(
+            question_text,
+            preference_text,
+            travel_mode,
+            trip_details,
+            transport_modes,
+            str(parsed_profile.get('duration_source') or ''),
+        ),
         source_query=source_query,
         conversation_id=request.conversation_id,
         waypoints=merged_waypoints,

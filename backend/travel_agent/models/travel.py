@@ -80,6 +80,7 @@ class TripDayPlan(BaseModel):
     weather_tips: list[str] = Field(default_factory=list)
     packing_tips: list[str] = Field(default_factory=list)
     weather_tags: list[str] = Field(default_factory=list)
+    transport_block: dict[str, Any] | None = None
     morning: str
     afternoon: str
     evening: str

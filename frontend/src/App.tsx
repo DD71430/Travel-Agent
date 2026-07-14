@@ -1,4 +1,8 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
+import { SidebarPanel, type SidebarHistoryEntry } from './SidebarPanel'
+import { QUICK_ACTIONS, buildChatTextFields, buildTravelPlanChatSummary, createQuickActionDraft, getResponseResultKind } from './chatUi'
+import { limitPlanDays, replacePlanResult } from './planDisplay'
+import { findWeatherDayForPlanDay, formatWeatherDisplayLine, isFallbackWeatherForDisplay } from './weatherDisplay'
 
 type Role = 'user' | 'assistant'
 
@@ -35,7 +39,19 @@ type ScenicHighlight = {
   detail?: string
 }
 
+type TransportBlock = {
+  mode?: string
+  label?: string
+  origin?: string
+  destination?: string
+  ride_minutes?: number | string
+  buffer_minutes?: number | string
+  total_minutes?: number | string
+  summary?: string
+}
+
 type RouteDebug = {
+  generated_at?: string
   origin_point?: string | null
   destination_point?: string | null
   best_option?: RouteOption
@@ -51,6 +67,7 @@ type RouteDebug = {
   must_visit_attractions?: string[]
   waypoint_order_mode?: string
   unscheduled_waypoints?: string[]
+  stage_segments?: { transport_block?: TransportBlock }[]
 }
 
 type WeatherDay = {
@@ -102,8 +119,31 @@ type ConversationTurn = {
   assistant_output: string
 }
 
-type Waypoint = {
-  name: string
+type ConversationSummary = {
+  conversation_id: string
+  title?: string
+  last_user_input?: string
+  last_assistant_output?: string
+  updated_at?: string
+  intent?: string
+}
+
+type MemoryStatus = {
+  backend?: string
+  connected?: boolean
+  fallback_reason?: string
+  [key: string]: unknown
+}
+
+type ConversationListResponse = {
+  conversations?: ConversationSummary[]
+  meta?: { memory?: MemoryStatus }
+}
+
+type ConversationHistoryResponse = {
+  conversation_id?: string
+  history?: ConversationTurn[]
+  meta?: { memory?: MemoryStatus }
 }
 
 type WaypointDetail = {
@@ -130,6 +170,7 @@ type TripDayPlan = {
   weather_tips?: string[]
   packing_tips?: string[]
   weather_tags?: string[]
+  transport_block?: TransportBlock | null
   morning: string
   afternoon: string
   evening: string
@@ -212,7 +253,7 @@ type TravelRequestDebug = {
   source_query?: string | null
   trip_profile?: Record<string, unknown>
   waypoint_order?: boolean
-  waypoints?: Waypoint[]
+  waypoints?: { name: string }[]
 }
 
 type NearbyCandidate = {
@@ -251,66 +292,32 @@ type UnifiedChatResponse = {
   error?: string | null
 }
 
-type PlanForm = {
-  origin: string
-  destination: string
-  preferences: string
-  travel_mode: 'driving' | 'walking' | 'transit' | 'bicycling'
-  waypoint_order: boolean
-  waypoints: Waypoint[]
-}
-
-const defaultForm: PlanForm = {
-  origin: '',
-  destination: '',
-  preferences: '',
-  travel_mode: 'driving',
-  waypoint_order: false,
-  waypoints: [],
-}
-
 const HISTORY_KEY = 'travel-agent-ui-history'
-const FORM_KEY = 'travel-agent-ui-form'
 const CONVERSATION_KEY = 'travel-agent-ui-conversation-id'
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '') || '/api'
 const apiUrl = (path: string) => `${API_BASE_URL}${path}`
-
-const TRAVEL_MODES: PlanForm['travel_mode'][] = ['driving', 'walking', 'transit', 'bicycling']
-const TRAVEL_MODE_LABELS: Record<PlanForm['travel_mode'], string> = {
-  driving: '驾车',
-  walking: '步行',
-  transit: '公交',
-  bicycling: '骑行',
-}
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object'
 }
 
-function detectQuestionIntent(text: string): 'nearby' | 'travel' | 'general' {
-  const source = text.trim()
-  if (/(附近|周边|酒店|餐厅|美食|景点|博物馆|公园|商场)/.test(source)) return 'nearby'
-  if (/(路线|规划|行程|从.+到.+|怎么去|怎么走|出发|目的地|途经|一日游|两天一晚|三天两晚|旅游|攻略)/.test(source)) return 'travel'
-  return 'general'
-}
-
-function normalizeForm(raw: unknown): PlanForm {
-  const candidate = isObject(raw) ? (raw as Partial<PlanForm>) : {}
-  return {
-    origin: typeof candidate.origin === 'string' ? candidate.origin : defaultForm.origin,
-    destination: typeof candidate.destination === 'string' ? candidate.destination : defaultForm.destination,
-    preferences: typeof candidate.preferences === 'string' ? candidate.preferences : defaultForm.preferences,
-    travel_mode: candidate.travel_mode && TRAVEL_MODES.includes(candidate.travel_mode) ? candidate.travel_mode : defaultForm.travel_mode,
-    waypoint_order: typeof candidate.waypoint_order === 'boolean' ? candidate.waypoint_order : defaultForm.waypoint_order,
-    waypoints: Array.isArray(candidate.waypoints)
-      ? candidate.waypoints.filter((item): item is Waypoint => Boolean(item && typeof item.name === 'string')).map((item) => ({ name: item.name }))
-      : [],
-  }
-}
-
 function normalizeHistory(raw: unknown): ConversationTurn[] {
   if (!Array.isArray(raw)) return []
   return raw.filter((item): item is ConversationTurn => Boolean(item && typeof item.user_input === 'string' && typeof item.assistant_output === 'string'))
+}
+
+function normalizeConversationSummaries(raw: unknown): ConversationSummary[] {
+  if (!Array.isArray(raw)) return []
+  return raw
+    .filter((item): item is ConversationSummary => Boolean(item && typeof item.conversation_id === 'string'))
+    .map((item) => ({
+      conversation_id: item.conversation_id,
+      title: typeof item.title === 'string' ? item.title : '',
+      last_user_input: typeof item.last_user_input === 'string' ? item.last_user_input : '',
+      last_assistant_output: typeof item.last_assistant_output === 'string' ? item.last_assistant_output : '',
+      updated_at: typeof item.updated_at === 'string' ? item.updated_at : '',
+      intent: typeof item.intent === 'string' ? item.intent : '',
+    }))
 }
 
 function normalizeTravelPlan(raw: unknown): TravelPlanResponse | null {
@@ -325,7 +332,7 @@ function normalizeTravelPlan(raw: unknown): TravelPlanResponse | null {
     history: candidate.history || [],
     transportation_suggestion: candidate.transportation_suggestion || [],
     attraction_recommendations: candidate.attraction_recommendations || [],
-    daily_itinerary: candidate.daily_itinerary || [],
+    daily_itinerary: limitPlanDays(candidate.daily_itinerary, candidate.duration_days),
     travel_tips: candidate.travel_tips || [],
   }
 }
@@ -353,14 +360,6 @@ function getDataSourceLabel(value?: string) {
   return `fallback(${value})`
 }
 
-
-function createQuickPrompt(mode: 'travel' | 'nearby') {
-  const prompts = {
-    travel: '帮我规划一个三天两晚的旅行路线，优先经典景点和合理游览节奏',
-    nearby: '推荐北京故宫附近的酒店、餐厅和景点',
-  }
-  return prompts[mode]
-}
 
 function getTripTypeLabel(value?: string, stageMode?: unknown) {
   if (stageMode === 'route_then_destination') return '沿途 + 目的地'
@@ -402,6 +401,19 @@ function formatHistoryTitle(text: string) {
   const match = text.match(/从?([^，。；,]+?)(?:自驾|驾车|开车|公交|公共交通|地铁|骑行|步行)?(?:到|去)([^，。；,]+?)(?:\d|三|两|一|，|,|。|$)/)
   if (match) return `${match[1].replace(/^从/, '').trim()} -> ${match[2].trim()}`
   return text.length > 18 ? `${text.slice(0, 18)}...` : text
+}
+
+function formatGeneratedAt(value?: string) {
+  if (!value) return '本次会话'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '本次会话'
+  return new Intl.DateTimeFormat('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(date)
 }
 
 function getProfileNumber(profile: Record<string, unknown> | null | undefined, key: string) {
@@ -449,12 +461,41 @@ function getWaypointOrderLabel(value?: string) {
   return '未指定'
 }
 
-function ToolChip({ label, onClick }: { label: string; onClick: () => void }) {
-  return (
-    <button type="button" className="chip" onClick={onClick}>
-      {label}
-    </button>
-  )
+function getTransportModeLabel(value?: unknown, local = false) {
+  const mode = typeof value === 'string' ? value : ''
+  const intercityLabels: Record<string, string> = {
+    driving: '自驾/驾车',
+    high_speed_rail: '高铁/动车',
+    train: '火车/铁路',
+    flight: '飞机/航班',
+    coach: '长途大巴',
+    transit: '公共交通',
+    unknown: '未指定',
+  }
+  const localLabels: Record<string, string> = {
+    driving: '自驾/打车',
+    taxi: '打车/网约车',
+    transit: '市内公共交通',
+    walking: '步行',
+    bicycling: '骑行',
+    mixed: '市内公共交通/打车',
+    unknown: '未指定',
+  }
+  return (local ? localLabels : intercityLabels)[mode] || mode || '未指定'
+}
+
+function getProfileString(profile: Record<string, unknown> | null | undefined, key: string) {
+  const value = profile?.[key]
+  return typeof value === 'string' && value.trim() ? value : ''
+}
+
+function formatDayTransport(day: TripDayPlan) {
+  const block = isObject(day.transport_block) ? day.transport_block : null
+  const label = typeof block?.label === 'string' && block.label.trim() ? block.label : ''
+  const summary = typeof block?.summary === 'string' && block.summary.trim() ? block.summary : ''
+  if (summary) return summary
+  if (label) return `${label}约${day.drive_time || '按实时班次'}`
+  return day.drive_time || '按实时路况'
 }
 
 function PlanCard({ plan }: { plan: TravelPlanResponse }) {
@@ -480,21 +521,32 @@ function PlanCard({ plan }: { plan: TravelPlanResponse }) {
   const weatherAdjustments = dedupeStrings(plan.weather_adjustments?.length ? plan.weather_adjustments : weatherPlanSummary?.weather_adjustments)
   const packingSummary = dedupeStrings(plan.packing_summary?.length ? plan.packing_summary : weatherPlanSummary?.packing_summary)
   const dailyWeatherBriefs = dedupeStrings(weatherPlanSummary?.daily_weather_briefs)
+  const visibleDailyItinerary = limitPlanDays(plan.daily_itinerary, plan.duration_days)
   const memoryLabel = getMemoryStatusLabel(plan.response_meta)
   const sourceLabel = getDataSourceLabel(plan.data_source)
-  const stopCount = waypointDetails.length || (routeDebug?.request_debug?.waypoints && Array.isArray(routeDebug.request_debug.waypoints) ? routeDebug.request_debug.waypoints.length : 0)
+  const intercityMode = getProfileString(tripProfile, 'intercity_mode') || String(routeDebug?.request_debug?.travel_mode || '')
+  const localMode = getProfileString(tripProfile, 'local_mode')
+  const intercityLabel = getProfileString(tripProfile, 'intercity_label') || getTransportModeLabel(intercityMode)
+  const localLabel = getProfileString(tripProfile, 'local_label') || (localMode ? getTransportModeLabel(localMode, true) : '')
+  const transportDisplay = localLabel && localLabel !== intercityLabel ? `${intercityLabel} + ${localLabel}` : intercityLabel || '--'
+  const weatherDebugDays = visibleDailyItinerary.map((day) => ({
+    day: day.day,
+    anchor_city: day.anchor_city,
+    weather_badge: day.weather_badge,
+    weather_summary: day.weather_summary,
+    matched_weather_day: findWeatherDayForPlanDay(day, dailyWeather) || null,
+  }))
+  const generatedAt = getProfileString(routeDebug?.request_debug, 'generated_at') || routeDebug?.generated_at
   const overviewItems = [
     { label: '天数', value: `${plan.duration_days || '--'} 天` },
-    { label: '总距离', value: plan.route_total_distance || routeDebug?.best_option?.distance || '--' },
+    { label: '交通方式', value: transportDisplay },
     { label: '总耗时', value: plan.route_total_duration || routeDebug?.best_option?.duration || '--' },
-    { label: '天气状态', value: weatherContext?.data_source === 'fallback' ? '天气待确认' : weatherOverview },
-    { label: '数据来源', value: sourceLabel },
-    { label: '途经点', value: `${stopCount} 个` },
+    { label: '总距离', value: plan.route_total_distance || routeDebug?.best_option?.distance || '--' },
   ]
 
   const renderDayCard = (day: TripDayPlan) => {
-    const weatherDay = dailyWeather[day.day - 1]
-    const isFallbackWeather = (weatherDay?.data_source || weatherContext?.data_source) !== 'tencent_maps'
+    const weatherDay = findWeatherDayForPlanDay(day, dailyWeather)
+    const isFallbackWeather = isFallbackWeatherForDisplay(day, weatherDay, weatherContext?.data_source)
     const weatherTips = dedupeStrings(day.weather_tips?.length ? day.weather_tips : weatherDay?.weather_tips)
     const packingTips = dedupeStrings(day.packing_tips?.length ? day.packing_tips : weatherDay?.packing_tips)
     const badge = day.weather_badge || getWeatherBadge(weatherDay, isFallbackWeather)
@@ -513,13 +565,13 @@ function PlanCard({ plan }: { plan: TravelPlanResponse }) {
           <strong>{badge}</strong>
           {isFallbackWeather ? (
             <>
-              <span>{day.anchor_city || weatherDay?.city || '目的地'} · 未获取实时天气</span>
+              <span>{formatWeatherDisplayLine(day, weatherDay, true)}</span>
               <small>本日不做天气重排</small>
             </>
           ) : (
             <>
-              <span>{weatherDay ? formatWeatherDay(weatherDay, false) : day.weather_summary || '天气参考'}</span>
-              <small>{day.weather_summary || weatherDay?.strategy}</small>
+              <span>{formatWeatherDisplayLine(day, weatherDay, false)}</span>
+              <small>{day.weather_summary || weatherDay?.strategy || '已用于行程排序'}</small>
             </>
           )}
         </div>
@@ -538,12 +590,21 @@ function PlanCard({ plan }: { plan: TravelPlanResponse }) {
           </div>
         ) : null}
         <div className="day-route-meta">
-          <span>行驶/转场：{day.drive_time || '按实时路况'}</span>
+          <span>交通/转场：{formatDayTransport(day)}</span>
           <span>可游玩：{day.visit_time || '约半天至全天'}</span>
         </div>
-        <p><b>上午：</b>{day.morning}</p>
-        <p><b>下午：</b>{day.afternoon}</p>
-        <p><b>晚上：</b>{day.evening}</p>
+        <div className="day-schedule">
+          {[
+            ['上午', day.morning],
+            ['下午', day.afternoon],
+            ['晚上', day.evening],
+          ].map(([period, content]) => (
+            <div key={period} className="schedule-row">
+              <span>{period}</span>
+              <p>{content}</p>
+            </div>
+          ))}
+        </div>
         {day.attractions?.length ? (
           <div className="note-row">
             {day.attractions.map((item) => <span key={`${day.day}-${item.name}`}>{item.name}{item.must_visit === 'true' ? ' · 必去' : ''}{item.tags ? ` · ${item.tags}` : ''}</span>)}
@@ -580,7 +641,10 @@ function PlanCard({ plan }: { plan: TravelPlanResponse }) {
           <h3>{plan.route_title}</h3>
           <p>{plan.trip_overview || plan.summary}</p>
         </div>
-        <span className="status-badge">{sourceLabel}</span>
+        <div className="result-source">
+          <span className="status-badge">{sourceLabel}</span>
+          <time>生成于 {formatGeneratedAt(generatedAt)}</time>
+        </div>
       </div>
 
       <div className="overview-strip">
@@ -595,9 +659,10 @@ function PlanCard({ plan }: { plan: TravelPlanResponse }) {
       {plan.data_source && plan.data_source !== 'tencent_maps' ? (
         <div className="fallback-banner">当前为兜底规划，真实路线、营业时间和票务信息请以出行前查询为准。</div>
       ) : null}
-      {weatherContext?.data_source === 'fallback' ? (
-        <div className="weather-banner">天气待确认，建议出行前查看实时天气；本行程保留室内/室外备选。</div>
-      ) : null}
+      <div className={`weather-banner${weatherContext?.data_source === 'fallback' ? ' warning' : ' resolved'}`}>
+        <strong>{weatherContext?.data_source === 'fallback' ? '天气待确认' : '天气已融入行程'}</strong>
+        <span>{weatherContext?.data_source === 'fallback' ? '建议出行前查看实时天气；本行程保留室内/室外备选。' : weatherOverview}</span>
+      </div>
       {unscheduledWaypoints.length ? (
         <div className="fallback-banner">未安排途经点/景点：{unscheduledWaypoints.join('、')}。建议延长停留或作为备选。</div>
       ) : null}
@@ -620,7 +685,7 @@ function PlanCard({ plan }: { plan: TravelPlanResponse }) {
           <div className="plan-meta-grid">
             <div><span>行程类型</span><strong>{getTripTypeLabel(plan.trip_type, tripProfile?.stage_plan_mode)}</strong></div>
             <div><span>沿途/目的地</span><strong>{routeDays ?? 0} 天 / {destinationDays ?? 0} 天{bufferDays ? ` / 机动 ${bufferDays} 天` : ''}</strong></div>
-            <div><span>出行方式</span><strong>{String(routeDebug?.request_debug?.travel_mode || '--')}</strong></div>
+            <div><span>出行方式</span><strong>{transportDisplay}</strong></div>
             <div><span>顺序模式</span><strong>{getWaypointOrderLabel(routeDebug?.waypoint_order_mode)}</strong></div>
             <div><span>途经点</span><strong>{waypointDetails.length ? waypointDetails.map((item) => item.name).join('、') : '--'}</strong></div>
             <div><span>必去景点</span><strong>{mustVisitAttractions.length ? mustVisitAttractions.join('、') : '--'}</strong></div>
@@ -649,7 +714,7 @@ function PlanCard({ plan }: { plan: TravelPlanResponse }) {
 
       {activeTab === 'daily' ? (
         <div className="tab-panel itinerary-list">
-          {(plan.daily_itinerary || []).map(renderDayCard)}
+          {visibleDailyItinerary.map(renderDayCard)}
         </div>
       ) : null}
 
@@ -690,7 +755,7 @@ function PlanCard({ plan }: { plan: TravelPlanResponse }) {
               <div><span>路线来源</span><strong>{plan.data_source || '--'}</strong></div>
               <div><span>置信度</span><strong>{plan.confidence || '--'}</strong></div>
             </div>
-            <pre>{JSON.stringify({ memory: plan.response_meta?.memory, request_debug: routeDebug?.request_debug, weather_context: weatherContext?.request_debug }, null, 2)}</pre>
+            <pre>{JSON.stringify({ memory: plan.response_meta?.memory, request_debug: routeDebug?.request_debug, weather_context: weatherContext?.request_debug, weather_debug_days: weatherDebugDays }, null, 2)}</pre>
           </details>
         </div>
       ) : null}
@@ -768,13 +833,6 @@ function MessageBubble({ message }: { message: Message }) {
 }
 
 export default function App() {
-  const [form, setForm] = useState<PlanForm>(() => {
-    try {
-      return normalizeForm(JSON.parse(localStorage.getItem(FORM_KEY) || 'null'))
-    } catch {
-      return defaultForm
-    }
-  })
   const [input, setInput] = useState('')
   const [messages, setMessages] = useState<Message[]>([])
   const [conversationId, setConversationId] = useState(() => localStorage.getItem(CONVERSATION_KEY) || '')
@@ -795,10 +853,10 @@ export default function App() {
       return []
     }
   })
-
-  useEffect(() => {
-    localStorage.setItem(FORM_KEY, JSON.stringify(form))
-  }, [form])
+  const [conversationSummaries, setConversationSummaries] = useState<ConversationSummary[]>([])
+  const [memoryStatus, setMemoryStatus] = useState<MemoryStatus | null>(null)
+  const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [mobileView, setMobileView] = useState<'chat' | 'result'>('chat')
 
   useEffect(() => {
     if (conversationId) localStorage.setItem(CONVERSATION_KEY, conversationId)
@@ -810,21 +868,23 @@ export default function App() {
 
   const hasUpload = Boolean(upload)
   const canSend = (input.trim().length > 0 || hasUpload) && !loading
-  const canPlan = form.origin.trim().length > 0 && form.destination.trim().length > 0 && !loading
+  const memoryLabel = memoryStatus ? (memoryStatus.connected ? 'Redis 已连接' : '内存 fallback') : '服务端历史'
 
-  const updateField = <K extends keyof PlanForm>(key: K, value: PlanForm[K]) => {
-    setForm((prev) => ({ ...prev, [key]: value }))
+  const refreshConversationList = async () => {
+    try {
+      const response = await fetch(apiUrl('/chat/conversations'))
+      if (!response.ok) throw new Error(`历史记录请求失败 ${response.status}`)
+      const data = (await response.json()) as ConversationListResponse
+      setConversationSummaries(normalizeConversationSummaries(data.conversations))
+      if (data.meta?.memory) setMemoryStatus(data.meta.memory)
+    } catch {
+      setConversationSummaries([])
+    }
   }
 
-  const updateWaypoint = (index: number, value: string) => {
-    setForm((prev) => ({
-      ...prev,
-      waypoints: prev.waypoints.map((item, i) => (i === index ? { ...item, name: value } : item)),
-    }))
-  }
-
-  const addWaypoint = () => setForm((prev) => ({ ...prev, waypoints: [...prev.waypoints, { name: '' }] }))
-  const removeWaypoint = (index: number) => setForm((prev) => ({ ...prev, waypoints: prev.waypoints.filter((_, i) => i !== index) }))
+  useEffect(() => {
+    void refreshConversationList()
+  }, [])
 
   const resetUploadState = () => {
     setUploadPreview('')
@@ -832,23 +892,6 @@ export default function App() {
     setUploadKind('')
     setAudioDebug(null)
     setLastAudioDebugText('')
-  }
-
-  const appendContextToFormData = (formData: FormData, intent: ReturnType<typeof detectQuestionIntent>) => {
-    if (intent === 'travel') {
-      formData.append('origin', form.origin)
-      formData.append('destination', form.destination)
-      formData.append('preferences', form.preferences)
-      formData.append('travel_mode', form.travel_mode)
-      formData.append('waypoint_order', String(form.waypoint_order))
-      formData.append('waypoints_json', JSON.stringify(form.waypoints.filter((item) => item.name.trim()).map((item) => ({ name: item.name.trim() }))))
-      return
-    }
-
-    formData.append('preferences', form.preferences)
-    formData.append('travel_mode', form.travel_mode)
-    formData.append('origin', form.origin)
-    formData.append('destination', form.destination)
   }
 
   const applyUploadContext = (uploadContext?: UploadContext | null) => {
@@ -889,13 +932,20 @@ export default function App() {
 
   const syncResponseState = (data: UnifiedChatResponse) => {
     setConversationId(data.conversation_id || '')
+    applyUploadContext(data.upload_context)
+    const memory = data.meta?.memory
+    if (isObject(memory)) setMemoryStatus(memory as MemoryStatus)
 
     const answerType = data.answer_type || 'general_chat'
     const travelPlan = normalizeTravelPlan(data.data?.travel_plan)
     const nearby = data.data?.nearby
     const weather = data.data?.weather
+    const resultKind = getResponseResultKind(answerType, {
+      hasTravelPlan: Boolean(travelPlan),
+      hasWeather: Boolean(weather),
+    })
 
-    if (answerType === 'nearby_search') {
+    if (resultKind === 'nearby') {
       setResult(null)
       setWeatherResult(null)
       const hotels = nearby?.hotel_candidates?.length
@@ -909,29 +959,29 @@ export default function App() {
         : '景点：没有'
       const nearbyText = [hotels, foods, attractions].join('\n')
       setMessages((prev) => [...prev, { role: 'assistant', content: nearbyText }])
-    } else if (answerType === 'travel_planning' && travelPlan) {
-      setResult({ ...travelPlan, response_meta: data.meta })
+    } else if (resultKind === 'travel' && travelPlan) {
+      setResult((current) => replacePlanResult(current, { ...travelPlan, response_meta: data.meta }))
       setWeatherResult(null)
       setHistory(travelPlan.history || [])
-      setMessages((prev) => [...prev, { role: 'assistant', content: data.final_answer || travelPlan.summary || '暂无结果' }])
-    } else if (answerType === 'weather_query' && weather) {
+      setMessages((prev) => [...prev, { role: 'assistant', content: buildTravelPlanChatSummary(travelPlan) }])
+      setMobileView('result')
+    } else if (resultKind === 'weather' && weather) {
       setResult(null)
       setWeatherResult({ ...weather, response_meta: data.meta })
       setMessages((prev) => [...prev, { role: 'assistant', content: data.final_answer || weather.summary || '暂无天气结果' }])
+      setMobileView('result')
     } else {
       setResult(null)
       setWeatherResult(null)
       setMessages((prev) => [...prev, { role: 'assistant', content: data.final_answer || '暂无结果' }])
     }
+    void refreshConversationList()
   }
 
   const requestChat = async (questionText: string) => {
-    const intent = detectQuestionIntent(questionText)
-
     const buildFormData = () => {
       const formData = new FormData()
-      formData.append('question', questionText)
-      if (intent !== 'nearby' && conversationId) formData.append('conversation_id', conversationId)
+      buildChatTextFields({ question: questionText, conversationId }).forEach(([name, value]) => formData.append(name, value))
       if (upload) {
         if (upload.type.startsWith('audio/')) {
           formData.append('audio', upload)
@@ -939,7 +989,6 @@ export default function App() {
           formData.append('image', upload)
         }
       }
-      appendContextToFormData(formData, intent)
       return formData
     }
 
@@ -972,6 +1021,8 @@ export default function App() {
 
     setLoading(true)
     setError('')
+    setResult(null)
+    setWeatherResult(null)
     setMessages((prev) => [...prev, { role: 'user', content: questionText }])
 
     try {
@@ -989,227 +1040,201 @@ export default function App() {
     }
   }
 
-  const runPlan = async () => {
-    if (!canPlan) return
-    setLoading(true)
-    setError('')
-
-    try {
-      const response = await fetch(apiUrl('/plan'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          origin: form.origin,
-          destination: form.destination,
-          preferences: form.preferences,
-          travel_mode: form.travel_mode,
-          conversation_id: conversationId || undefined,
-          waypoints: form.waypoints.filter((item) => item.name.trim()).map((item) => ({ name: item.name.trim() })),
-          waypoint_order: form.waypoint_order,
-          request_source: 'sidebar',
-        }),
-      })
-
-      if (!response.ok) {
-        const detail = await response.text().catch(() => '')
-        throw new Error(detail || `请求失败 ${response.status}`)
-      }
-
-      const data = normalizeTravelPlan(await response.json())
-      if (!data) throw new Error('旅行规划结果格式无效')
-      setResult(data)
-      setWeatherResult(null)
-      setConversationId(data.conversation_id || '')
-      setHistory(data.history || [])
-      setMessages((prev) => [...prev, { role: 'assistant', content: data.summary }])
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '未知错误')
-      setResult(null)
-      setWeatherResult(null)
-    } finally {
-      setLoading(false)
-    }
-  }
-
   const applyHistory = (item: ConversationTurn) => {
     setInput(item.user_input)
     setMessages((prev) => [...prev, { role: 'assistant', content: item.assistant_output }])
   }
 
-  const resetAll = () => {
+  const applyConversationSummary = async (item: ConversationSummary) => {
+    setConversationId(item.conversation_id)
+    setInput(item.last_user_input || '')
+    try {
+      const response = await fetch(apiUrl(`/chat/history/${encodeURIComponent(item.conversation_id)}`))
+      if (!response.ok) throw new Error(`会话历史请求失败 ${response.status}`)
+      const data = (await response.json()) as ConversationHistoryResponse
+      const turns = normalizeHistory(data.history || [])
+      setHistory(turns)
+      if (data.meta?.memory) setMemoryStatus(data.meta.memory)
+      if (turns.length) {
+        setMessages(turns.flatMap((turn) => [
+          { role: 'user' as const, content: turn.user_input },
+          { role: 'assistant' as const, content: turn.assistant_output },
+        ]))
+        setInput(turns[turns.length - 1]?.user_input || item.last_user_input || '')
+      } else {
+        setMessages([{ role: 'assistant', content: item.last_assistant_output || '该会话暂无可展示的短期历史。' }])
+      }
+      setResult(null)
+      setWeatherResult(null)
+    } catch {
+      setMessages((prev) => [...prev, { role: 'assistant', content: item.last_assistant_output || '暂时无法读取该会话历史。' }])
+    }
+  }
+
+  const startNewConversation = () => {
     setMessages([])
     setResult(null)
     setWeatherResult(null)
-    setHistory([])
     setConversationId('')
+    setInput('')
+    setError('')
     setUpload(null)
     resetUploadState()
+    setMobileView('chat')
+    setSidebarOpen(false)
     localStorage.removeItem(CONVERSATION_KEY)
-    localStorage.removeItem(HISTORY_KEY)
   }
 
-  const quickActionButtons = useMemo(() => ([
-    { label: '旅行规划', value: createQuickPrompt('travel') },
-    { label: '周边推荐', value: createQuickPrompt('nearby') },
-  ]), [])
+  const historyEntries: SidebarHistoryEntry[] = conversationSummaries.length
+    ? conversationSummaries.map((item) => ({
+      id: item.conversation_id,
+      title: item.title || formatHistoryTitle(item.last_user_input || item.conversation_id),
+      summary: item.last_assistant_output || item.last_user_input || '暂无摘要',
+      updatedAt: item.updated_at,
+      active: item.conversation_id === conversationId,
+    }))
+    : history.map((item, index) => ({
+      id: `local-${index}`,
+      title: formatHistoryTitle(item.user_input),
+      summary: item.assistant_output,
+    }))
+
+  const selectHistoryEntry = (id: string) => {
+    const summary = conversationSummaries.find((item) => item.conversation_id === id)
+    if (summary) {
+      void applyConversationSummary(summary)
+    } else if (id.startsWith('local-')) {
+      const item = history[Number(id.slice(6))]
+      if (item) applyHistory(item)
+    }
+    setSidebarOpen(false)
+  }
+
+  const clearComposer = () => {
+    setInput('')
+    setUpload(null)
+    resetUploadState()
+    setAudioDebug(null)
+    setLastAudioDebugText('')
+  }
 
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div>
+        <button
+          type="button"
+          className="icon-button history-toggle"
+          title="打开历史记录"
+          aria-label="打开历史记录"
+          aria-controls="workspace-sidebar"
+          aria-expanded={sidebarOpen}
+          onClick={() => setSidebarOpen(true)}
+        >☰</button>
+        <div className="brand-block">
           <p className="eyebrow">AI 出行 Agent</p>
           <h1>智能旅游规划工作台</h1>
-          <p className="subtitle">统一支持旅行规划与周边推荐，行程中保留实时天气参考。</p>
+          <p className="subtitle">在对话中描述完整需求，统一生成路线、天气与交通安排。</p>
         </div>
         <div className="topbar-actions">
           <span className="status-pill">{conversationId ? `会话 ${conversationId.slice(0, 8)}` : '新会话'}</span>
-          <button className="ghost-button" onClick={resetAll}>清空会话</button>
+          <button type="button" className="icon-button" title="新建会话" aria-label="新建会话" onClick={startNewConversation}>＋</button>
         </div>
       </header>
 
+      <div className="mobile-view-switch" role="group" aria-label="移动端工作区切换">
+        <button type="button" className={mobileView === 'chat' ? 'active' : ''} onClick={() => setMobileView('chat')}>对话</button>
+        <button type="button" className={mobileView === 'result' ? 'active' : ''} onClick={() => setMobileView('result')}>结果</button>
+      </div>
+
+      {sidebarOpen ? <button type="button" className="sidebar-scrim" aria-label="关闭历史侧栏" onClick={() => setSidebarOpen(false)} /> : null}
+
       <main className="workspace">
-        <aside className="sidebar left-panel">
-          <section className="card">
-            <div className="section-head">
-              <h2>快捷指令</h2>
-            </div>
-            <div className="chip-row">
-              {quickActionButtons.map((item) => (
-                <ToolChip key={item.label} label={item.label} onClick={() => setInput(item.value)} />
-              ))}
-            </div>
-          </section>
-
-          <section className="card">
-            <div className="section-head">
-              <h2>行程偏好</h2>
-            </div>
-            <div className="field-list">
-              <label>
-                出发地
-                <input placeholder="如：济南西站" value={form.origin} onChange={(e) => updateField('origin', e.target.value)} />
-              </label>
-              <label>
-                目的地
-                <input placeholder="如：北京" value={form.destination} onChange={(e) => updateField('destination', e.target.value)} />
-              </label>
-              <label>
-                偏好
-                <textarea
-                  rows={3}
-                  placeholder="如：三天两晚、预算3000、亲子出行、沿途想看博物馆和公园"
-                  value={form.preferences}
-                  onChange={(e) => updateField('preferences', e.target.value)}
-                />
-              </label>
-              <label>
-                出行方式
-                <select value={form.travel_mode} onChange={(e) => updateField('travel_mode', e.target.value as PlanForm['travel_mode'])}>
-                  <option value="driving">驾车</option>
-                  <option value="walking">步行</option>
-                  <option value="transit">公交</option>
-                  <option value="bicycling">骑行</option>
-                </select>
-              </label>
-              <label className="checkbox-row">
-                <input type="checkbox" checked={form.waypoint_order} onChange={(e) => updateField('waypoint_order', e.target.checked)} />
-                <span>启用途经点智能排序</span>
-              </label>
-            </div>
-
-            <div className="waypoints-block">
-              <div className="section-head compact-head">
-                <h3>途经点</h3>
-                <button type="button" className="ghost-button small" onClick={addWaypoint}>添加</button>
-              </div>
-              {form.waypoints.length === 0 ? <p className="muted">可留空，或在聊天里输入“途经泰安、德州”自动识别</p> : null}
-              {form.waypoints.map((item, index) => (
-                <div key={index} className="waypoint-row">
-                  <input value={item.name} onChange={(e) => updateWaypoint(index, e.target.value)} placeholder={`途经点 ${index + 1}`} />
-                  <button type="button" className="ghost-button small" onClick={() => removeWaypoint(index)}>删除</button>
-                </div>
-              ))}
-            </div>
-
-            <button className="primary-button full-width" onClick={runPlan} disabled={!canPlan}>
-              {loading ? '规划中...' : '生成路线方案'}
-            </button>
-          </section>
-
-          <section className="card history-card">
-            <div className="section-head">
-              <h2>历史记录</h2>
-              <span className="muted">{history.length} 条</span>
-            </div>
-            <div className="history-list">
-              {history.length === 0 ? (
-                <p className="empty-state">暂无历史记录</p>
-              ) : history.map((item, index) => (
-                <button key={`${item.user_input}-${index}`} className="history-item" onClick={() => applyHistory(item)}>
-                  <strong>{formatHistoryTitle(item.user_input)}</strong>
-                  <span>{item.assistant_output}</span>
-                </button>
-              ))}
-            </div>
-          </section>
+        <aside id="workspace-sidebar" className={`left-panel${sidebarOpen ? ' open' : ''}`}>
+          <SidebarPanel
+            quickActions={QUICK_ACTIONS}
+            historyEntries={historyEntries}
+            memoryLabel={memoryLabel}
+            memoryConnected={Boolean(memoryStatus?.connected)}
+            onSelectPrompt={(action) => {
+              const draft = createQuickActionDraft(action)
+              setInput(draft.input)
+              setMobileView('chat')
+              setSidebarOpen(false)
+            }}
+            onSelectHistory={selectHistoryEntry}
+            onNewConversation={startNewConversation}
+            onClose={() => setSidebarOpen(false)}
+          />
         </aside>
 
-        <section className="center-panel card chat-card">
+        <section className={`center-panel chat-card${mobileView === 'chat' ? '' : ' mobile-hidden'}`}>
           <div className="section-head">
             <h2>对话区</h2>
-            <span className="muted">支持多轮输入与多模态</span>
+            <span className="muted">唯一需求入口 · 支持文件与多轮会话</span>
           </div>
 
           <div className="chat-stream">
             {messages.length === 0 ? (
               <div className="empty-chat">
                 <h3>开始提问吧</h3>
-                <p>你可以直接询问附近酒店/餐厅，或输入出行需求生成完整路线方案。</p>
+                <p>请直接写明出发地、目的地、天数、交通方式、途经城市和游览偏好。</p>
               </div>
             ) : messages.map((message, index) => <MessageBubble key={`${message.role}-${index}`} message={message} />)}
+            {loading ? <div className="message assistant loading-message" role="status"><span className="message-role">Agent</span><p>正在分析路线、天气与交通安排…</p></div> : null}
           </div>
 
           <div className="composer">
             <textarea
-              rows={4}
+              rows={3}
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              placeholder="输入旅行规划或周边推荐需求"
+              placeholder="例如：从济南到杭州三天两晚，乘高铁，途经徐州一天，偏好博物馆和经典景点…"
             />
 
             <div className="composer-actions">
-              <label className="file-input">
-                <input
-                  type="file"
-                  accept="image/*,.pdf,.txt,.md,.csv,.log,.json,audio/*"
-                  onChange={async (e) => {
-                    const selected = e.target.files?.[0] || null
-                    setUpload(selected)
-                    resetUploadState()
-                    if (selected) {
-                      const isAudio = selected.type.startsWith('audio/') || /\.(mp3|wav|m4a|aac|ogg|webm|flac|opus|amr|3gp)$/i.test(selected.name)
-                      const isImage = selected.type.startsWith('image/')
-                      const isTextLike = !isAudio && !isImage && /\.(txt|md|csv|log|json)$/i.test(selected.name)
-                      setUploadKind(isAudio ? 'audio' : isImage ? 'image' : 'other')
-                      if (isTextLike) {
-                        try {
-                          const text = await selected.text()
-                          const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim()
-                          if (normalized) {
-                            setInput(normalized)
-                            setUploadPreview(normalized)
+              <div className="composer-toolbar">
+                <div className="composer-tools">
+                  <label className="icon-button file-input" title="上传图片、文档、PDF 或语音" aria-label="上传图片、文档、PDF 或语音">
+                    <input
+                      type="file"
+                      accept="image/*,.pdf,.txt,.md,.csv,.log,.json,audio/*"
+                      onChange={async (e) => {
+                        const selected = e.target.files?.[0] || null
+                        setUpload(selected)
+                        resetUploadState()
+                        if (selected) {
+                          const isAudio = selected.type.startsWith('audio/') || /\.(mp3|wav|m4a|aac|ogg|webm|flac|opus|amr|3gp)$/i.test(selected.name)
+                          const isImage = selected.type.startsWith('image/')
+                          const isTextLike = !isAudio && !isImage && /\.(txt|md|csv|log|json)$/i.test(selected.name)
+                          setUploadKind(isAudio ? 'audio' : isImage ? 'image' : 'other')
+                          if (isTextLike) {
+                            try {
+                              const text = await selected.text()
+                              const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim()
+                              if (normalized) {
+                                setInput(normalized)
+                                setUploadPreview(normalized)
+                              }
+                            } catch {
+                              // Server extraction remains available when local preview fails.
+                            }
                           }
-                        } catch {
-                          // ignore local preview failure and fallback to server extraction
+                        } else {
+                          setUploadKind('')
                         }
-                      }
-                    } else {
-                      setUploadKind('')
-                    }
-                  }}
-                />
-                <span>{upload ? `已选${uploadKind === 'audio' ? '语音文件' : uploadKind === 'image' ? '图片文件' : '文件'}：${upload.name}` : '上传图片、文档、PDF 或语音文件后将根据内容回答'}</span>
-              </label>
+                      }}
+                    />
+                    <span aria-hidden="true">↑</span>
+                  </label>
+                  <span className="upload-name">{upload ? upload.name : '图片 / 文档 / 语音'}</span>
+                </div>
+                <div className="composer-commands">
+                  <button type="button" className="icon-button" title="清空输入" aria-label="清空输入" onClick={clearComposer} disabled={loading}>×</button>
+                  <button type="button" className="primary-button send-button" onClick={() => runChat()} disabled={!canSend}>
+                    {loading ? '发送中…' : '发送'}
+                  </button>
+                </div>
+              </div>
 
               {import.meta.env.DEV && uploadKind === 'audio' && (uploadPreview || lastAudioDebugText) ? (
                 <div className="debug-box">
@@ -1220,36 +1245,17 @@ export default function App() {
               {uploadKind === 'image' && uploadPreview ? <p className="muted">图片识别结果：{uploadPreview}</p> : null}
               {uploadKind !== 'audio' && uploadKind !== 'image' && uploadPreview ? <p className="muted">识别内容预览：{uploadPreview}</p> : null}
               {uploadError ? <p className="error-text">{uploadError}</p> : null}
-
-              <div className="action-row">
-                <button
-                  className="ghost-button"
-                  onClick={() => {
-                    setInput('')
-                    setUpload(null)
-                    resetUploadState()
-                    setAudioDebug(null)
-                    setLastAudioDebugText('')
-                  }}
-                  disabled={loading}
-                >
-                  清空输入
-                </button>
-                <button className="primary-button" onClick={() => runChat()} disabled={!canSend}>
-                  {loading ? '思考中...' : '发送消息'}
-                </button>
-              </div>
             </div>
 
             {error ? <p className="error-text">{error}</p> : null}
           </div>
         </section>
 
-        <aside className="sidebar right-panel">
-          <section className="card route-card">
+        <aside className={`right-panel${mobileView === 'result' ? '' : ' mobile-hidden'}`}>
+          <section className="route-card">
             <div className="section-head">
               <h2>结果面板</h2>
-              <span className="muted">统一结果展示</span>
+              <span className="muted">路线、天气与交通统一展示</span>
             </div>
 
             {weatherResult ? (
@@ -1257,7 +1263,7 @@ export default function App() {
             ) : result ? (
               <PlanCard plan={result} />
             ) : (
-              <div className="empty-state">还没有生成结果，先在左侧提交出行天数、预算、目的地和偏好，或直接询问“杭州天气”。</div>
+              <div className="empty-state result-empty">还没有结果。在对话区输入完整旅行需求，或直接询问“未来三天杭州天气”。</div>
             )}
           </section>
         </aside>

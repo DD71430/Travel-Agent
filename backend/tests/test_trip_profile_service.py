@@ -67,6 +67,29 @@ def test_parse_stage_sum_when_route_and_destination_days_are_explicit():
     assert profile['duration_days'] == 6
 
 
+def test_explicit_trip_duration_wins_over_stopover_and_destination_remainder():
+    question = '帮我规划一个从杭州到济南三天两晚的旅行路线，要求乘坐高铁，在徐州游玩两天，剩余时间在济南游玩，优先经典景点和合理游览节奏'
+
+    profile = build_trip_profile_from_text(question)
+
+    assert profile['duration_days'] == 3
+    assert profile['nights'] == 2
+    assert profile['explicit_total_days'] == 3
+    assert profile['duration_source'] == 'explicit_duration'
+    assert profile['route_days'] == 2
+    assert profile['destination_days'] == 1
+    assert profile['buffer_days'] == 0
+    assert any(stop['name'] == '徐州' and stop['stay_days'] == 2 for stop in profile['route_stops'])
+
+
+def test_stage_day_parser_only_counts_actual_destination_as_destination_days():
+    stopover_profile = build_trip_profile_from_text('从杭州到济南，在徐州游玩两天，剩余时间在济南游玩')
+    destination_profile = build_trip_profile_from_text('从杭州到济南，在济南游玩两天')
+
+    assert stopover_profile['destination_days'] != 2
+    assert destination_profile['destination_days'] == 2
+
+
 def test_parse_destination_only_when_route_has_no_play():
     profile = build_trip_profile_from_text('从北京到西安，中途不玩，到西安玩三天')
     assert profile['route_days'] == 0

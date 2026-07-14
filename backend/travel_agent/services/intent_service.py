@@ -103,7 +103,7 @@ def extract_trip_details(text: str | None) -> dict[str, str | None]:
 
 def extract_travel_mode(text: str | None, fallback: str | None = None) -> str:
     source = text or ''
-    if any(keyword in source for keyword in ('公交', '地铁', '公共交通', '巴士', '大巴', '换乘')):
+    if any(keyword in source for keyword in ('公交', '地铁', '公共交通', '巴士', '大巴', '换乘', '高铁', '动车', '火车', '列车', '铁路', '飞机', '航班', '机场', '长途汽车', '客车')):
         return 'transit'
     if any(keyword in source for keyword in ('骑行', '单车', '自行车')):
         return 'bicycling'

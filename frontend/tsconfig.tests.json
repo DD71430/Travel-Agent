@@ -1,0 +1,20 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": ".test-dist",
+    "rootDir": ".",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext"
+  },
+  "include": [
+    "src/weatherDisplay.ts",
+    "src/planDisplay.ts",
+    "src/chatUi.ts",
+    "src/SidebarPanel.tsx",
+    "tests/weatherDisplay.test.ts",
+    "tests/planDisplay.test.ts",
+    "tests/chatUi.test.ts",
+    "tests/SidebarPanel.test.tsx"
+  ]
+}

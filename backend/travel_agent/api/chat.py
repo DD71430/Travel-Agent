@@ -69,6 +69,8 @@ def _remember(conversation_id: str, user_question: str, response: dict[str, Any]
     final_answer = str(response.get('final_answer') or '')
     memory_store.append_turn(conversation_id, user_question, final_answer)
     memory_store.update_profile(conversation_id, {'last_question': user_question, 'intent': intent, 'last_upload': upload_context})
+    if hasattr(memory_store, 'update_conversation_meta'):
+        memory_store.update_conversation_meta(conversation_id, intent=intent)
 
 
 @router.post('')
@@ -85,6 +87,23 @@ async def chat(request: ChatRequest) -> dict[str, Any]:
 @router.get('')
 def chat_health() -> dict[str, str]:
     return {'status': 'ok'}
+
+
+@router.get('/conversations')
+def list_conversations(limit: int = 20) -> dict[str, Any]:
+    return {
+        'conversations': memory_store.list_conversations(limit=limit),
+        'meta': {'memory': memory_store.status()},
+    }
+
+
+@router.get('/history/{conversation_id}')
+def get_conversation_history(conversation_id: str, limit: int = 10) -> dict[str, Any]:
+    return {
+        'conversation_id': conversation_id,
+        'history': memory_store.get_history(conversation_id, limit=limit),
+        'meta': {'memory': memory_store.status()},
+    }
 
 
 @router.post('/multimodal')

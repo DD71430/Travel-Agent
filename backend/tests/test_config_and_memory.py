@@ -67,6 +67,10 @@ def test_redis_memory_fake_client_sets_ttl_and_merges_profile(monkeypatch):
             self.commands.append(('hset', key, mapping))
             return self
 
+        def zadd(self, key, mapping):
+            self.commands.append(('zadd', key, mapping))
+            return self
+
         def execute(self):
             for command in self.commands:
                 if command[0] == 'rpush':
@@ -82,12 +86,16 @@ def test_redis_memory_fake_client_sets_ttl_and_merges_profile(monkeypatch):
                 elif command[0] == 'hset':
                     _, key, mapping = command
                     self.client.hashes.setdefault(key, {}).update(mapping)
+                elif command[0] == 'zadd':
+                    _, key, mapping = command
+                    self.client.zsets.setdefault(key, {}).update(mapping)
             return []
 
     class FakeRedis:
         def __init__(self):
             self.lists = {}
             self.hashes = {}
+            self.zsets = {}
             self.expirations = {}
 
         def ping(self):
@@ -103,6 +111,10 @@ def test_redis_memory_fake_client_sets_ttl_and_merges_profile(monkeypatch):
         def pipeline(self, transaction=False):
             assert transaction is False
             return FakePipeline(self)
+
+        def zrevrange(self, key, start, end):
+            values = sorted(self.zsets.get(key, {}).items(), key=lambda item: item[1], reverse=True)
+            return [item[0] for item in values[start : end + 1]]
 
     fake = FakeRedis()
     monkeypatch.setattr(redis_memory.redis, 'from_url', lambda *args, **kwargs: fake)
@@ -126,6 +138,39 @@ def test_redis_memory_fake_client_sets_ttl_and_merges_profile(monkeypatch):
     assert context_a['long_term']['last_origin'] == '济南'
     assert context_a['long_term']['weather_sensitivity'] == ['怕热']
     assert all(ttl == status['ttl_seconds'] for ttl in fake.expirations.values())
+
+
+def test_append_turn_indexes_conversation_in_fallback(monkeypatch):
+    import travel_agent.memory.redis_memory as redis_memory
+
+    monkeypatch.setattr(redis_memory.redis, 'from_url', lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError('redis unavailable')))
+    store = RedisMemoryStore()
+
+    store.append_turn('conv-a', '你好', '你好，已记录')
+    store.append_turn('conv-b', '从杭州到西安三天两晚', '杭州到西安规划')
+    store.update_conversation_meta('conv-b', intent='travel_planning')
+
+    conversations = store.list_conversations(limit=10)
+
+    assert [item['conversation_id'] for item in conversations] == ['conv-b', 'conv-a']
+    assert conversations[0]['title'] == '从杭州到西安三天两晚'
+    assert conversations[0]['intent'] == 'travel_planning'
+    assert conversations[0]['last_assistant_output'] == '杭州到西安规划'
+
+
+def test_get_history_returns_short_term_in_fallback(monkeypatch):
+    import travel_agent.memory.redis_memory as redis_memory
+
+    monkeypatch.setattr(redis_memory.redis, 'from_url', lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError('redis unavailable')))
+    store = RedisMemoryStore()
+
+    for index in range(12):
+        store.append_turn('conv-a', f'问题{index}', f'回答{index}')
+
+    history = store.get_history('conv-a', limit=3)
+
+    assert [item['user_input'] for item in history] == ['问题9', '问题10', '问题11']
+    assert [item['assistant_output'] for item in history] == ['回答9', '回答10', '回答11']
 
 
 @pytest.mark.asyncio

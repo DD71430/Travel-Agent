@@ -199,8 +199,23 @@ def _parse_explicit_total_days(source: str) -> int | None:
     )
 
 
-def parse_stage_days(text: str | None) -> dict[str, int | None | str]:
+def _parse_explicit_duration(source: str) -> tuple[int | None, str | None]:
+    explicit_total = _parse_explicit_total_days(source)
+    if explicit_total is not None:
+        return explicit_total, 'explicit_total'
+    explicit_duration = _first_number_for_patterns(
+        source,
+        (
+            r'(?P<num>\d+|[一二两三四五六七八九十]+)\s*[天日]\s*(?:\d+|[一二两三四五六七八九十]+)\s*晚',
+            r'(?:行程时长|旅行时长|游玩时长|天数)\s*[：:]?\s*(?P<num>\d+|[一二两三四五六七八九十]+)\s*天',
+        ),
+    )
+    return (explicit_duration, 'explicit_duration') if explicit_duration is not None else (None, None)
+
+
+def parse_stage_days(text: str | None, *, destination: str | None = None) -> dict[str, int | None | str]:
     source = text or ''
+    destination_clean = (destination or '').replace('市', '').strip()
     route_no_play = bool(re.search(r'(中途|路上|沿途|途中)(?:不|不用|不要|不安排)(?:玩|游玩|景点|停留)', source))
     destination_no_play = bool(re.search(r'(目的地|到达后|到了[^，。；,]*|到[^，。；,]{1,12})(?:不|不用|不要)(?:玩|游玩|停留)|到了就返程', source))
     route_days = 0 if route_no_play else _first_number_for_patterns(
@@ -210,14 +225,18 @@ def parse_stage_days(text: str | None) -> dict[str, int | None | str]:
             r'(?:途中|路上|沿途|中途).*?(?P<num>\d+|[一二两三四五六七八九十]+)\s*天',
         ),
     )
-    destination_days = 0 if destination_no_play else _first_number_for_patterns(
-        source,
-        (
-            r'(?:目的地|到目的地|目的地深度游)(?:游玩|玩|安排|深度游)?(?P<num>\d+|[一二两三四五六七八九十]+)\s*天',
-            r'(?:到了|到|在)(?:目的地|[^，。；,\s]{1,12})(?:后|之后|后再|再)?(?:游玩|玩|安排|深度游|停留)(?P<num>\d+|[一二两三四五六七八九十]+)\s*天',
-            r'(?:到了|到)(?:目的地|[^，。；,\s]{1,12})(?:后|之后|后再|再)(?P<num>\d+|[一二两三四五六七八九十]+)\s*天',
-        ),
-    )
+    destination_patterns = [
+        r'(?:目的地|到目的地|目的地深度游)(?:游玩|玩|安排|深度游)?(?P<num>\d+|[一二两三四五六七八九十]+)\s*天',
+    ]
+    if destination_clean:
+        escaped_destination = re.escape(destination_clean)
+        destination_patterns.extend(
+            (
+                rf'(?:到了?|到|在)\s*{escaped_destination}(?:市)?(?:后|之后|后再|再)?(?:游玩|玩|安排|深度游|停留)(?P<num>\d+|[一二两三四五六七八九十]+)\s*天',
+                rf'(?:到了?|到)\s*{escaped_destination}(?:市)?(?:后|之后|后再|再)(?P<num>\d+|[一二两三四五六七八九十]+)\s*天',
+            )
+        )
+    destination_days = 0 if destination_no_play else _first_number_for_patterns(source, tuple(destination_patterns))
     route_nights = _first_number_for_patterns(
         source,
         (
@@ -225,13 +244,15 @@ def parse_stage_days(text: str | None) -> dict[str, int | None | str]:
             r'(?:路上|途中|沿途).*?(?P<num>\d+|[一二两三四五六七八九十]+)\s*晚',
         ),
     )
-    destination_nights = _first_number_for_patterns(
-        source,
-        (
-            r'(?:目的地|到目的地|到了[^，。；,]*|到[^，。；,]{1,12})(?:住|住宿)(?P<num>\d+|[一二两三四五六七八九十]+)\s*晚',
-            r'(?:目的地|到目的地|到了[^，。；,]*|到[^，。；,]{1,12}).*?(?P<num>\d+|[一二两三四五六七八九十]+)\s*晚',
-        ),
-    )
+    destination_night_patterns = [
+        r'(?:目的地|到目的地)(?:住|住宿)(?P<num>\d+|[一二两三四五六七八九十]+)\s*晚',
+    ]
+    if destination_clean:
+        escaped_destination = re.escape(destination_clean)
+        destination_night_patterns.append(
+            rf'(?:到了?|到|在)\s*{escaped_destination}(?:市)?(?:后|之后)?(?:住|住宿)(?P<num>\d+|[一二两三四五六七八九十]+)\s*晚'
+        )
+    destination_nights = _first_number_for_patterns(source, tuple(destination_night_patterns))
     if route_days is not None and destination_days is not None:
         stage_plan_mode = 'route_then_destination' if route_days > 0 and destination_days > 0 else 'destination_only' if route_days == 0 else 'route_only'
         total_days_source = 'stage_sum'
@@ -282,14 +303,12 @@ def _wants_destination_remainder(source: str, destination: str | None) -> bool:
     return False
 
 
-def _route_days_from_stops(route_stops: list[dict[str, Any]], total_days: int | None, wants_destination_remainder: bool) -> int | None:
+def _route_days_from_stops(route_stops: list[dict[str, Any]], total_days: int | None) -> int | None:
     if not route_stops:
         return None
     full_stop_days = sum(max(1, _ceil_positive_days(stop.get('stay_days') or stop.get('stay_nights'))) for stop in route_stops if float(stop.get('stay_days') or 0) >= 1 or int(stop.get('stay_nights') or 0) >= 1)
     if full_stop_days:
         inferred = full_stop_days
-        if wants_destination_remainder and (total_days is None or total_days > inferred):
-            inferred += 1
     else:
         inferred = 1
     if total_days is not None and total_days > 1:
@@ -304,15 +323,15 @@ def build_trip_profile_from_text(text: str | None, *, origin: str | None = None,
     merged_destination = destination or parsed_destination
     trip_details = extract_trip_details(source)
     mode = extract_travel_mode(source, travel_mode)
-    explicit_total_days = _parse_explicit_total_days(source)
-    duration_days = int(trip_details['duration_days']) if trip_details.get('duration_days') else None
+    explicit_total_days, duration_source = _parse_explicit_duration(source)
+    duration_days = explicit_total_days or (int(trip_details['duration_days']) if trip_details.get('duration_days') else None)
     nights = int(trip_details['nights']) if trip_details.get('nights') else None
-    stage_days = parse_stage_days(source)
+    stage_days = parse_stage_days(source, destination=merged_destination)
     route_days = stage_days.get('route_days')
     destination_days = stage_days.get('destination_days')
     route_stops = parse_route_stops(source, destination=merged_destination)
     wants_remainder = _wants_destination_remainder(source, merged_destination)
-    stop_route_days = _route_days_from_stops(route_stops, duration_days, wants_remainder)
+    stop_route_days = _route_days_from_stops(route_stops, duration_days)
     if stop_route_days is not None:
         route_days = max(int(route_days), stop_route_days) if isinstance(route_days, int) else stop_route_days
     if wants_remainder and destination_days is None and duration_days is not None and isinstance(route_days, int):
@@ -321,22 +340,26 @@ def build_trip_profile_from_text(text: str | None, *, origin: str | None = None,
         destination_days = max(1, duration_days - int(route_days))
     if isinstance(route_days, int) and isinstance(destination_days, int):
         stage_sum = route_days + destination_days
-        if explicit_total_days is not None and explicit_total_days > stage_sum:
+        if explicit_total_days is not None:
             duration_days = explicit_total_days
-            total_days_source = 'explicit_total'
+            total_days_source = str(duration_source or 'explicit_duration')
         else:
             duration_days = stage_sum
             total_days_source = 'stage_sum'
     else:
-        total_days_source = 'explicit_total' if duration_days is not None else str(stage_days.get('total_days_source') or 'inferred')
+        total_days_source = str(duration_source or (stage_days.get('total_days_source') if duration_days is None else 'inferred') or 'inferred')
         if duration_days is None and isinstance(route_days, int):
             duration_days = route_days
         if duration_days is None and isinstance(destination_days, int):
             duration_days = destination_days
     if duration_days is None and nights is not None:
         duration_days = nights + 1
+        duration_source = 'nights_inferred'
+        total_days_source = 'nights_inferred'
     if duration_days is None:
         duration_days = 2 if any(keyword in source for keyword in ('周末', '两天', '二天')) else 3
+        duration_source = 'default'
+        total_days_source = 'default'
     if wants_remainder and destination_days is None and isinstance(route_days, int):
         if duration_days - route_days <= 0 and duration_days > 1:
             route_days = duration_days - 1
@@ -380,6 +403,7 @@ def build_trip_profile_from_text(text: str | None, *, origin: str | None = None,
         'route_stops': route_stops,
         'destination_stay_days': destination_days,
         'total_days_source': total_days_source,
+        'duration_source': duration_source or ('stage_sum' if total_days_source == 'stage_sum' else 'inferred'),
         'stage_plan_mode': stage_days.get('stage_plan_mode'),
         'explicit_total_days': explicit_total_days,
     }
@@ -395,7 +419,7 @@ def build_trip_profile(request: TravelPlanRequest) -> dict[str, Any]:
     base.setdefault('avoid_tags', profile['avoid_tags'])
     base.setdefault('pace', profile['pace'])
     base.setdefault('trip_type', profile['trip_type'])
-    for key in ('route_days', 'destination_days', 'buffer_days', 'route_nights', 'destination_nights', 'route_stops', 'destination_stay_days', 'total_days_source', 'stage_plan_mode'):
+    for key in ('route_days', 'destination_days', 'buffer_days', 'route_nights', 'destination_nights', 'route_stops', 'destination_stay_days', 'total_days_source', 'duration_source', 'stage_plan_mode', 'explicit_total_days'):
         base.setdefault(key, profile.get(key))
     return base
 

@@ -23,6 +23,17 @@ def test_travel_mode_detection():
     assert build_travel_request(ChatRequest(question='从济南到北京自驾')).travel_mode == 'driving'
 
 
+def test_high_speed_rail_is_structured_separately_from_local_mode():
+    result = build_travel_request(
+        ChatRequest(question='帮我规划一个从济南到杭州三天两晚的旅行路线，要求乘坐高铁，在徐州游玩一天，剩余时间在杭州游玩')
+    )
+
+    assert result.travel_mode == 'transit'
+    assert result.trip_profile['intercity_mode'] == 'high_speed_rail'
+    assert result.trip_profile['local_mode'] == 'mixed'
+    assert result.trip_profile['transport_preference_source'] == 'question'
+
+
 def test_waypoints_json_parsing():
     request = ChatRequest(question='从济南到北京途经泰安', waypoints_json='[{"name":"曲阜"}]')
     travel_request = build_travel_request(request)

@@ -114,3 +114,51 @@ async def test_unified_graph_keeps_xuzhou_stopover_as_route_segment(monkeypatch)
     assert plan['daily_itinerary'][0]['anchor_city'] == '徐州'
     assert plan['daily_itinerary'][-1]['stage'] == 'destination'
     assert plan['daily_itinerary'][-1]['anchor_city'] == '杭州'
+
+
+@pytest.mark.asyncio
+async def test_unified_graph_passes_daily_city_allocation_to_weather(monkeypatch):
+    from travel_agent.agent import travel_graph
+
+    monkeypatch.setattr(travel_planner.settings, 'tencent_maps_key', '')
+    monkeypatch.setattr(travel_planner._client, 'key', '')
+    captured: dict[str, object] = {}
+
+    def fake_weather_context(destination, route_stops=None, days=3, location_debug=None, daily_plan_context=None):
+        captured['daily_plan_context'] = daily_plan_context
+        anchors = [str(item.get('anchor_city') or destination) for item in daily_plan_context or []]
+        return {
+            'data_source': 'tencent_maps',
+            'destination': destination,
+            'summary': '测试天气',
+            'daily_weather': [
+                {
+                    'day': index,
+                    'city': city,
+                    'weather': '多云',
+                    'temperature': '20-28℃',
+                    'data_source': 'tencent_maps',
+                    'weather_tags': [],
+                    'weather_tips': [],
+                    'packing_tips': [],
+                }
+                for index, city in enumerate(anchors, start=1)
+            ],
+            'warnings': [],
+            'request_debug': {'provider': 'test'},
+        }
+
+    monkeypatch.setattr(travel_graph, 'build_weather_context', fake_weather_context)
+    state = await unified_graph.ainvoke(
+        {
+            'request': ChatRequest(
+                question='帮我规划一个从杭州到济南三天两晚的旅行路线，要求乘坐高铁，在徐州游玩两天，剩余时间在济南游玩，优先经典景点和合理游览节奏'
+            ),
+            'conversation_id': 'test-graph-daily-weather-targets',
+        }
+    )
+
+    plan = state['data']['travel_plan']
+    assert plan['duration_days'] == 3
+    assert [item['anchor_city'] for item in plan['daily_itinerary']] == ['徐州', '徐州', '济南']
+    assert [item['anchor_city'] for item in captured['daily_plan_context']] == ['徐州', '徐州', '济南']

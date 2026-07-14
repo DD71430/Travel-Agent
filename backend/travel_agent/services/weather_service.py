@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date, timedelta
 import re
 from typing import Any
 
@@ -8,10 +9,46 @@ from travel_agent.tools.tencent_webservice_client import TencentWebServiceClient
 
 settings = get_settings()
 _client = TencentWebServiceClient()
+WEATHER_PIPELINE_VERSION = 'daily-city-v2'
 
 _EXTREME_WEATHER = ('暴雨', '大暴雨', '特大暴雨', '台风', '沙尘', '雷暴', '大风', '冰雹')
 _RAIN_WEATHER = ('雨', '阵雨', '雷阵雨', '大雨', '中雨', '小雨')
 _GOOD_WEATHER = ('晴', '多云', '阴')
+_KNOWN_CITY_ADCODES = {
+    '北京': '110000',
+    '上海': '310000',
+    '广州': '440100',
+    '深圳': '440300',
+    '杭州': '330100',
+    '济南': '370100',
+    '徐州': '320300',
+    '南京': '320100',
+    '苏州': '320500',
+    '成都': '510100',
+    '重庆': '500000',
+    '武汉': '420100',
+    '西安': '610100',
+    '天津': '120000',
+    '青岛': '370200',
+    '厦门': '350200',
+    '长沙': '430100',
+    '郑州': '410100',
+    '合肥': '340100',
+    '福州': '350100',
+    '昆明': '530100',
+    '哈尔滨': '230100',
+    '大连': '210200',
+    '宁波': '330200',
+    '无锡': '320200',
+    '佛山': '440600',
+    '东莞': '441900',
+    '烟台': '370600',
+    '珠海': '440400',
+    '南昌': '360100',
+    '泰安': '370900',
+    '德州': '371400',
+    '曲阜': '370881',
+}
 
 
 def _dedupe_text(items: list[str]) -> list[str]:
@@ -393,10 +430,32 @@ def _forecast_items_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]
     return items
 
 
-def extract_tencent_weather_days(payload: dict[str, Any], city: str, days: int, *, start_day: int = 1, adcode: str | None = None) -> list[dict[str, Any]]:
+def extract_tencent_weather_days(
+    payload: dict[str, Any],
+    city: str,
+    days: int,
+    *,
+    start_day: int = 1,
+    forecast_offset: int = 0,
+    adcode: str | None = None,
+) -> list[dict[str, Any]]:
     forecasts = _forecast_items_from_payload(payload)
     daily: list[dict[str, Any]] = []
-    for offset, item in enumerate(forecasts[:days]):
+    safe_offset = max(0, forecast_offset)
+    for offset in range(days):
+        expected_date = (date.today() + timedelta(days=safe_offset + offset)).isoformat()
+        dated_index = next(
+            (
+                item_index
+                for item_index, candidate in enumerate(forecasts)
+                if isinstance(candidate, dict) and _normalize_forecast_date(candidate.get('date')) == expected_date
+            ),
+            None,
+        )
+        forecast_index = dated_index if dated_index is not None else safe_offset + offset
+        if forecast_index >= len(forecasts):
+            continue
+        item = forecasts[forecast_index]
         if not isinstance(item, dict):
             continue
         index = start_day + offset
@@ -416,6 +475,8 @@ def extract_tencent_weather_days(payload: dict[str, Any], city: str, days: int, 
                 'data_source': 'tencent_maps',
                 'fallback_reason': None,
                 'adcode': adcode,
+                'forecast_index': forecast_index,
+                'forecast_date': item.get('date'),
                 **suitability,
                 **tips,
             }
@@ -423,8 +484,119 @@ def extract_tencent_weather_days(payload: dict[str, Any], city: str, days: int, 
     return daily
 
 
-def _extract_forecasts(payload: dict[str, Any], city: str, days: int, *, start_day: int = 1, adcode: str | None = None) -> list[dict[str, Any]]:
-    return extract_tencent_weather_days(payload, city, days, start_day=start_day, adcode=adcode)
+def _normalize_forecast_date(value: Any) -> str:
+    raw = str(value or '').strip()
+    digits = re.sub(r'\D', '', raw)
+    if len(digits) == 8:
+        return f'{digits[:4]}-{digits[4:6]}-{digits[6:]}'
+    return raw[:10]
+
+
+def _extract_forecasts(
+    payload: dict[str, Any],
+    city: str,
+    days: int,
+    *,
+    start_day: int = 1,
+    forecast_offset: int = 0,
+    adcode: str | None = None,
+) -> list[dict[str, Any]]:
+    return extract_tencent_weather_days(payload, city, days, start_day=start_day, forecast_offset=forecast_offset, adcode=adcode)
+
+
+def _extract_adcode(payload: dict[str, Any]) -> str | None:
+    result = payload.get('result') if isinstance(payload, dict) else {}
+    ad_info = result.get('ad_info') if isinstance(result, dict) else {}
+    adcode = ad_info.get('adcode') if isinstance(ad_info, dict) else None
+    return str(adcode) if adcode else None
+
+
+def resolve_weather_adcode(city: str, destination: str, location_debug: dict[str, Any] | None, explicit: Any = None, *, allow_known_city: bool = False) -> dict[str, str | None]:
+    if explicit:
+        return {'adcode': str(explicit), 'adcode_source': 'explicit'}
+    safe_city = _safe_city(city)
+    if isinstance(location_debug, dict):
+        for key in (
+            f'waypoint_adcode:{safe_city}',
+            f'waypoint_adcode:{safe_city}市',
+            f'anchor_adcode:{safe_city}',
+            f'anchor_adcode:{safe_city}市',
+        ):
+            if location_debug.get(key):
+                return {'adcode': str(location_debug[key]), 'adcode_source': key}
+        if _safe_city(destination) == safe_city:
+            adcode = location_debug.get('destination_adcode') or location_debug.get('adcode')
+            if adcode:
+                return {'adcode': str(adcode), 'adcode_source': 'destination_adcode'}
+    known_adcode = _KNOWN_CITY_ADCODES.get(safe_city) if allow_known_city else None
+    if known_adcode:
+        return {'adcode': known_adcode, 'adcode_source': 'known_city'}
+    if allow_known_city and settings.tencent_maps_key:
+        try:
+            adcode = _extract_adcode(_client.geocoder(safe_city, region=safe_city))
+        except TencentWebServiceError:
+            return {'adcode': None, 'adcode_source': 'geocoder_failed'}
+        if adcode:
+            return {'adcode': adcode, 'adcode_source': 'geocoder'}
+    return {'adcode': None, 'adcode_source': 'missing_adcode'}
+
+
+def _adcode_for_city(city: str, destination: str, location_debug: dict[str, Any] | None, explicit: Any = None, *, allow_known_city: bool = False) -> str | None:
+    return resolve_weather_adcode(city, destination, location_debug, explicit, allow_known_city=allow_known_city).get('adcode')
+
+
+def _weather_target_debug(targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            'day': target.get('day'),
+            'city': target.get('city'),
+            'anchor_city': target.get('city'),
+            'adcode': target.get('adcode'),
+            'adcode_source': target.get('adcode_source'),
+            'data_source': target.get('data_source'),
+            'fallback_reason': target.get('fallback_reason'),
+            'forecast_index': target.get('forecast_index', max(0, int(target.get('day') or 1) - 1)),
+            'forecast_date': target.get('forecast_date'),
+            'retry_reason': target.get('retry_reason'),
+        }
+        for target in targets
+    ]
+
+
+def _mark_target(targets: list[dict[str, Any]], index: int, *, data_source: str, fallback_reason: str | None, retry_reason: str | None = None) -> None:
+    if index >= len(targets):
+        return
+    targets[index]['data_source'] = data_source
+    targets[index]['fallback_reason'] = fallback_reason
+    if retry_reason:
+        targets[index]['retry_reason'] = retry_reason
+
+
+def _fallback_day_for_target(target: dict[str, Any], destination: str, fallback_reason: str) -> dict[str, Any]:
+    fallback = _fallback_daily_weather(str(target.get('city') or destination), [], 1)[0]
+    fallback.update({'day': target['day'], 'city': target.get('city') or destination, 'fallback_reason': fallback_reason})
+    return fallback
+
+
+def _fallback_weather_for_targets(destination: str, route_stops: list[dict[str, Any]] | None, days: int, targets: list[dict[str, Any]], fallback_reason: str, *, use_targets: bool) -> list[dict[str, Any]]:
+    if use_targets:
+        return [_fallback_day_for_target(target, destination, fallback_reason) for target in targets]
+    daily_weather = _fallback_daily_weather(destination, route_stops, days)
+    for item in daily_weather:
+        item['fallback_reason'] = item.get('fallback_reason') or fallback_reason
+    return daily_weather
+
+
+def _daily_context_weather_targets(destination: str, daily_plan_context: list[dict[str, Any]] | None, days: int, location_debug: dict[str, Any] | None) -> list[dict[str, Any]]:
+    contexts = [item for item in (daily_plan_context or []) if isinstance(item, dict)]
+    targets: list[dict[str, Any]] = []
+    for index in range(days):
+        context = contexts[index] if index < len(contexts) else {}
+        city = _safe_city(str(context.get('anchor_city') or context.get('destination') or destination))
+        explicit_adcode = context.get('anchor_adcode') or context.get('adcode') or context.get('city_adcode')
+        resolved = resolve_weather_adcode(city, destination, location_debug, explicit_adcode, allow_known_city=True)
+        targets.append({'day': index + 1, 'city': city, **resolved})
+    return targets
 
 
 def _route_weather_targets(destination: str, route_stops: list[dict[str, Any]] | None, days: int, location_debug: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -436,12 +608,12 @@ def _route_weather_targets(destination: str, route_stops: list[dict[str, Any]] |
     for index in range(days):
         stop = stops[index] if index < len(stops) else {}
         city = _safe_city(str(stop.get('name') or destination))
-        adcode = stop.get('adcode') or stop.get('ad_code') or stop.get('city_adcode')
-        if not adcode and isinstance(location_debug, dict):
-            adcode = location_debug.get(f'waypoint_adcode:{city}') or location_debug.get(f'waypoint_adcode:{city}市')
-        if not adcode and _safe_city(city) == _safe_city(destination):
-            adcode = destination_adcode
-        targets.append({'day': index + 1, 'city': city, 'adcode': str(adcode) if adcode else None})
+        explicit_adcode = stop.get('adcode') or stop.get('ad_code') or stop.get('city_adcode')
+        resolved = resolve_weather_adcode(city, destination, location_debug, explicit_adcode, allow_known_city=False)
+        adcode = resolved.get('adcode')
+        if not adcode and _safe_city(city) == _safe_city(destination) and destination_adcode:
+            resolved = {'adcode': str(destination_adcode), 'adcode_source': 'destination_adcode'}
+        targets.append({'day': index + 1, 'city': city, **resolved})
     return targets
 
 
@@ -449,9 +621,32 @@ def _same_weather_target(left: dict[str, Any], right: dict[str, Any]) -> bool:
     return bool(left.get('adcode')) and left.get('adcode') == right.get('adcode') and _safe_city(str(left.get('city') or '')) == _safe_city(str(right.get('city') or ''))
 
 
-def build_weather_context(destination: str, route_stops: list[dict[str, Any]] | None = None, days: int = 3, location_debug: dict[str, Any] | None = None) -> dict[str, Any]:
+def _fetch_realtime_weather_day(adcode: str, target: dict[str, Any], destination: str) -> dict[str, Any] | None:
+    try:
+        payload = _client.weather_info(adcode)
+    except TencentWebServiceError:
+        return None
+    extracted = _extract_forecasts(
+        payload,
+        str(target.get('city') or destination),
+        1,
+        start_day=int(target.get('day') or 1),
+        adcode=adcode,
+    )
+    return extracted[0] if extracted else None
+
+
+def build_weather_context(
+    destination: str,
+    route_stops: list[dict[str, Any]] | None = None,
+    days: int = 3,
+    location_debug: dict[str, Any] | None = None,
+    daily_plan_context: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     safe_days = max(1, days)
-    targets = _route_weather_targets(destination, route_stops, safe_days, location_debug)
+    use_daily_targets = bool(daily_plan_context)
+    targets = _daily_context_weather_targets(destination, daily_plan_context, safe_days, location_debug) if use_daily_targets else _route_weather_targets(destination, route_stops, safe_days, location_debug)
+    debug_targets = [dict(target) for target in targets]
     if settings.tencent_maps_key and any(target.get('adcode') for target in targets):
         daily_weather: list[dict[str, Any]] = []
         target_index = 0
@@ -459,9 +654,8 @@ def build_weather_context(destination: str, route_stops: list[dict[str, Any]] | 
             target = targets[target_index]
             adcode = target.get('adcode')
             if not adcode:
-                fallback = _fallback_daily_weather(str(target.get('city') or destination), [], 1)[0]
-                fallback.update({'day': target['day'], 'city': target.get('city') or destination, 'fallback_reason': 'missing_adcode'})
-                daily_weather.append(fallback)
+                daily_weather.append(_fallback_day_for_target(target, destination, 'missing_adcode'))
+                _mark_target(debug_targets, target_index, data_source='fallback', fallback_reason='missing_adcode')
                 target_index += 1
                 continue
             span = 1
@@ -469,24 +663,44 @@ def build_weather_context(destination: str, route_stops: list[dict[str, Any]] | 
                 span += 1
             try:
                 payload = _client.weather_info(str(adcode), 'future')
-                extracted = _extract_forecasts(payload, str(target.get('city') or destination), span, start_day=int(target['day']), adcode=str(adcode))
+                forecast_offset = max(0, int(target['day']) - 1)
+                extracted = _extract_forecasts(
+                    payload,
+                    str(target.get('city') or destination),
+                    span,
+                    start_day=int(target['day']),
+                    forecast_offset=forecast_offset,
+                    adcode=str(adcode),
+                )
                 if extracted:
                     daily_weather.extend(extracted)
+                    for offset in range(len(extracted)):
+                        debug_targets[target_index + offset]['forecast_index'] = extracted[offset].get('forecast_index')
+                        debug_targets[target_index + offset]['forecast_date'] = extracted[offset].get('forecast_date')
+                        _mark_target(debug_targets, target_index + offset, data_source='tencent_maps', fallback_reason=None)
                     for missing_offset in range(len(extracted), span):
                         missing_target = targets[target_index + missing_offset]
-                        fallback = _fallback_daily_weather(str(missing_target.get('city') or destination), [], 1)[0]
-                        fallback.update({'day': missing_target['day'], 'city': missing_target.get('city') or destination, 'fallback_reason': 'empty_weather_forecast'})
-                        daily_weather.append(fallback)
+                        daily_weather.append(_fallback_day_for_target(missing_target, destination, 'empty_weather_forecast'))
+                        _mark_target(debug_targets, target_index + missing_offset, data_source='fallback', fallback_reason='empty_weather_forecast')
                     target_index += span
                     continue
                 fallback_reason = 'empty_weather_forecast'
             except TencentWebServiceError:
                 fallback_reason = 'weather_service_error'
+            realtime_day = _fetch_realtime_weather_day(str(adcode), target, destination) if int(target.get('day') or 1) == 1 else None
+            if realtime_day:
+                daily_weather.append(realtime_day)
+                _mark_target(debug_targets, target_index, data_source='tencent_maps', fallback_reason=None, retry_reason=f'realtime_after_{fallback_reason}')
+                for offset in range(1, span):
+                    missing_target = targets[target_index + offset]
+                    daily_weather.append(_fallback_day_for_target(missing_target, destination, fallback_reason))
+                    _mark_target(debug_targets, target_index + offset, data_source='fallback', fallback_reason=fallback_reason)
+                target_index += span
+                continue
             for offset in range(span):
                 missing_target = targets[target_index + offset]
-                fallback = _fallback_daily_weather(str(missing_target.get('city') or destination), [], 1)[0]
-                fallback.update({'day': missing_target['day'], 'city': missing_target.get('city') or destination, 'fallback_reason': fallback_reason})
-                daily_weather.append(fallback)
+                daily_weather.append(_fallback_day_for_target(missing_target, destination, fallback_reason))
+                _mark_target(debug_targets, target_index + offset, data_source='fallback', fallback_reason=fallback_reason)
             target_index += span
         if daily_weather and any(item.get('data_source') == 'tencent_maps' for item in daily_weather):
             all_real = all(item.get('data_source') == 'tencent_maps' for item in daily_weather)
@@ -500,14 +714,29 @@ def build_weather_context(destination: str, route_stops: list[dict[str, Any]] | 
                 'summary': summary,
                 'daily_weather': daily_weather,
                 'warnings': [] if all_real else ['weather_partial_fallback'],
-                'request_debug': {'provider': 'tencent_maps' if all_real else 'mixed', 'fallback_reason': None if all_real else 'partial_fallback', 'daily_fallback_reasons': fallback_reasons},
+                'request_debug': {
+                    'provider': 'tencent_maps' if all_real else 'mixed',
+                    'fallback_reason': None if all_real else 'partial_fallback',
+                    'daily_fallback_reasons': fallback_reasons,
+                    'weather_pipeline_version': WEATHER_PIPELINE_VERSION,
+                    'weather_targets': _weather_target_debug(debug_targets),
+                },
             }
-    daily_weather = _fallback_daily_weather(destination, route_stops, safe_days)
+    fallback_reason = 'missing_key_or_weather_unavailable'
+    for index in range(len(debug_targets)):
+        if not debug_targets[index].get('data_source'):
+            _mark_target(debug_targets, index, data_source='fallback', fallback_reason=fallback_reason)
+    daily_weather = _fallback_weather_for_targets(destination, route_stops, safe_days, targets, fallback_reason, use_targets=use_daily_targets)
     return {
         'data_source': 'fallback',
         'destination': destination,
         'summary': f'{_safe_city(destination)}天气待确认，建议出行前查看实时天气；本行程保留室内/室外备选。',
         'daily_weather': daily_weather,
         'warnings': ['weather_fallback'],
-        'request_debug': {'provider': 'fallback', 'fallback_reason': 'missing_key_or_weather_unavailable'},
+        'request_debug': {
+            'provider': 'fallback',
+            'fallback_reason': fallback_reason,
+            'weather_pipeline_version': WEATHER_PIPELINE_VERSION,
+            'weather_targets': _weather_target_debug(debug_targets),
+        },
     }
