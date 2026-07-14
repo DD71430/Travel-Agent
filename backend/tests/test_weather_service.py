@@ -48,7 +48,7 @@ def test_build_weather_context_uses_tencent_when_adcode_exists(monkeypatch):
 
     monkeypatch.setattr(weather_service.settings, 'tencent_maps_key', 'fake-key')
 
-    def fake_weather_info(adcode):
+    def fake_weather_info(adcode, weather_type=None):
         assert adcode == '320100'
         return {
             'status': 0,
@@ -65,6 +65,82 @@ def test_build_weather_context_uses_tencent_when_adcode_exists(monkeypatch):
     assert context['daily_weather'][0]['indoor_priority'] is True
     assert 'rain' in context['daily_weather'][0]['weather_tags']
     assert any('雨伞' in tip or '雨衣' in tip for tip in context['daily_weather'][0]['weather_tips'])
+
+
+def test_build_weather_context_accepts_tencent_realtime_payload(monkeypatch):
+    from travel_agent.services import weather_service
+
+    monkeypatch.setattr(weather_service.settings, 'tencent_maps_key', 'fake-key')
+
+    def fake_weather_info(adcode, weather_type=None):
+        assert adcode == '330100'
+        return {
+            'status': 0,
+            'message': 'Success',
+            'result': {
+                'realtime': [
+                    {
+                        'adcode': adcode,
+                        'city': '杭州市',
+                        'infos': {
+                            'weather': '晴天',
+                            'temperature': 36,
+                            'wind_direction': '西南风',
+                            'wind_power': '3-4级',
+                        },
+                    }
+                ]
+            },
+        }
+
+    monkeypatch.setattr(weather_service._client, 'weather_info', fake_weather_info)
+
+    context = build_weather_context('杭州', days=1, location_debug={'destination_adcode': '330100'})
+
+    assert context['data_source'] == 'tencent_maps'
+    assert context['daily_weather'][0]['data_source'] == 'tencent_maps'
+    assert context['daily_weather'][0]['weather'] == '晴天'
+    assert context['daily_weather'][0]['temperature'] == '36℃'
+    assert 'heat' in context['daily_weather'][0]['weather_tags']
+    assert any('防晒' in tip or '补水' in tip for tip in context['daily_weather'][0]['weather_tips'])
+
+
+def test_build_weather_context_accepts_tencent_future_infos_payload(monkeypatch):
+    from travel_agent.services import weather_service
+
+    calls = []
+    monkeypatch.setattr(weather_service.settings, 'tencent_maps_key', 'fake-key')
+
+    def fake_weather_info(adcode, weather_type=None):
+        calls.append((adcode, weather_type))
+        return {
+            'status': 0,
+            'message': 'Success',
+            'result': {
+                'forecast': [
+                    {
+                        'adcode': adcode,
+                        'city': '徐州市',
+                        'infos': [
+                            {'date': '2026-07-14', 'day': {'weather': '晴天', 'temperature': 34, 'wind_direction': '西风'}, 'night': {'weather': '小雨', 'temperature': 26, 'wind_direction': '北风'}},
+                            {'date': '2026-07-15', 'day': {'weather': '中雨', 'temperature': 33, 'wind_direction': '东风'}, 'night': {'weather': '大雨', 'temperature': 25, 'wind_direction': '北风'}},
+                            {'date': '2026-07-16', 'day': {'weather': '多云', 'temperature': 32, 'wind_direction': '北风'}, 'night': {'weather': '晴天', 'temperature': 24, 'wind_direction': '北风'}},
+                        ],
+                    }
+                ]
+            },
+        }
+
+    monkeypatch.setattr(weather_service._client, 'weather_info', fake_weather_info)
+
+    context = build_weather_context('徐州', days=3, location_debug={'destination_adcode': '320300'})
+
+    assert calls == [('320300', 'future')]
+    assert context['data_source'] == 'tencent_maps'
+    assert len(context['daily_weather']) == 3
+    assert [item['weather'] for item in context['daily_weather']] == ['晴天转小雨', '中雨转大雨', '多云转晴天']
+    assert context['daily_weather'][0]['temperature'] == '26-34℃'
+    assert 'rain' in context['daily_weather'][1]['weather_tags']
 
 
 def test_build_weather_tips_for_tencent_rain():
@@ -157,8 +233,8 @@ def test_weather_context_uses_route_stop_adcodes_per_day(monkeypatch):
     monkeypatch.setattr(weather_service.settings, 'tencent_maps_key', 'fake-key')
     calls = []
 
-    def fake_weather_info(adcode):
-        calls.append(adcode)
+    def fake_weather_info(adcode, weather_type=None):
+        calls.append((adcode, weather_type))
         weather = '阵雨' if adcode == '320300' else '晴'
         return {
             'status': 0,
@@ -178,7 +254,7 @@ def test_weather_context_uses_route_stop_adcodes_per_day(monkeypatch):
         location_debug={'destination_adcode': '330100'},
     )
 
-    assert calls == ['320300', '330100']
+    assert calls == [('320300', 'future'), ('330100', 'future')]
     assert [item['city'] for item in context['daily_weather']] == ['徐州', '杭州']
     assert context['daily_weather'][0]['data_source'] == 'tencent_maps'
     assert context['daily_weather'][0]['fallback_reason'] is None

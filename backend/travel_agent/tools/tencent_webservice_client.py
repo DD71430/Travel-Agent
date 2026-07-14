@@ -206,8 +206,11 @@ class TencentWebServiceClient:
     def location(self, lat: float, lng: float) -> dict[str, Any]:
         return self.reverse_geocoder(f'{lat},{lng}')
 
-    def weather_info(self, adcode: str) -> dict[str, Any]:
-        return self._request('/ws/weather/v1', {'adcode': adcode})
+    def weather_info(self, adcode: str, weather_type: str | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {'adcode': adcode}
+        if weather_type:
+            params['type'] = weather_type
+        return self._request('/ws/weather/v1', params)
 
     def wmts(self, layer: str, tile_matrix: str, tile_row: str, tile_col: str) -> dict[str, Any]:
         return {'layer': layer, 'tile_matrix': tile_matrix, 'tile_row': tile_row, 'tile_col': tile_col}

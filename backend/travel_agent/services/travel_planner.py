@@ -2167,14 +2167,18 @@ def _build_trip_itinerary(
             if '补水' not in evening:
                 evening = f'傍晚再补充户外点位并注意补水；{evening}'
         weather_data_source = str((weather_day or {}).get('data_source') or weather_context.get('data_source') or 'fallback')
+        fallback_weather_note = ''
         if weather_data_source != 'tencent_maps':
-            weather_strategy = '天气待确认，建议出行前查看实时天气；本行程保留室内/室外备选。'
+            weather_strategy = ''
+            weather_summary = ''
+            daily_weather_adjustments = []
+            fallback_weather_note = '天气策略：天气待确认，出行前查看实时天气；本日不做确定性天气重排。'
         else:
             weather_strategy = str((weather_day or {}).get('strategy') or '按实时天气调整室内外景点顺序。')
         weather_label = ''
         if weather_day:
             if weather_data_source != 'tencent_maps':
-                weather_label = f'当天天气：{anchor_city} 天气待确认。'
+                weather_label = ''
             else:
                 weather_label = f"当天天气：{weather_day.get('city', anchor_city)} {weather_day.get('weather', '天气待确认')}，{weather_day.get('temperature', '温度待确认')}。"
         generated_weather_tips = build_weather_tips(weather_day, data_source=weather_data_source) if weather_day else {}
@@ -2188,6 +2192,9 @@ def _build_trip_itinerary(
         weather_tips = structured_weather_list('weather_tips')
         packing_tips = structured_weather_list('packing_tips')
         weather_tags = structured_weather_list('weather_tags')
+        if weather_data_source != 'tencent_maps':
+            weather_tips = ['建议出行前查看实时天气，不做确定性天气重排。']
+            packing_tips = _dedupe_text(packing_tips or ['天气待确认，保留雨具、防晒和补水用品作为备选'])
         total_visit_minutes = morning_duration + afternoon_duration + min(evening_duration, 120)
         visit_note = (
             f'当日景点建议停留总时长约 {_format_duration_minutes(total_visit_minutes)}。'
@@ -2204,7 +2211,8 @@ def _build_trip_itinerary(
             stage_note,
             pace_note,
             weather_label,
-            f'天气策略：{weather_strategy}',
+            f'天气策略：{weather_strategy}' if weather_strategy else '',
+            fallback_weather_note,
             *daily_weather_adjustments,
             visit_note,
             transfer_note,

@@ -83,6 +83,20 @@ type WeatherPlanSummary = {
   packing_summary?: string[]
 }
 
+type WeatherQueryData = {
+  city?: string
+  adcode?: string | null
+  connected?: boolean
+  data_source?: string
+  fallback_reason?: string | null
+  summary?: string
+  daily_weather?: WeatherDay[]
+  weather_tips?: string[]
+  packing_tips?: string[]
+  debug?: Record<string, unknown>
+  response_meta?: Record<string, unknown>
+}
+
 type ConversationTurn = {
   user_input: string
   assistant_output: string
@@ -224,11 +238,12 @@ type NearbyDebug = {
 
 type UnifiedChatResponse = {
   conversation_id: string
-  answer_type: 'travel_planning' | 'nearby_search' | 'general_chat'
+  answer_type: 'travel_planning' | 'nearby_search' | 'general_chat' | 'weather_query'
   final_answer: string
   data?: {
     travel_plan?: TravelPlanResponse | null
     nearby?: NearbyDebug | null
+    weather?: WeatherQueryData | null
   }
   travel_request?: TravelRequestDebug | null
   upload_context?: UploadContext | null
@@ -383,6 +398,12 @@ function getDisplayNotes(day: TripDayPlan) {
   })
 }
 
+function formatHistoryTitle(text: string) {
+  const match = text.match(/从?([^，。；,]+?)(?:自驾|驾车|开车|公交|公共交通|地铁|骑行|步行)?(?:到|去)([^，。；,]+?)(?:\d|三|两|一|，|,|。|$)/)
+  if (match) return `${match[1].replace(/^从/, '').trim()} -> ${match[2].trim()}`
+  return text.length > 18 ? `${text.slice(0, 18)}...` : text
+}
+
 function getProfileNumber(profile: Record<string, unknown> | null | undefined, key: string) {
   const value = profile?.[key]
   if (typeof value === 'number') return value
@@ -478,26 +499,40 @@ function PlanCard({ plan }: { plan: TravelPlanResponse }) {
     const packingTips = dedupeStrings(day.packing_tips?.length ? day.packing_tips : weatherDay?.packing_tips)
     const badge = day.weather_badge || getWeatherBadge(weatherDay, isFallbackWeather)
     const tone = getWeatherTone(badge, day.weather_tags?.length ? day.weather_tags : weatherDay?.weather_tags, isFallbackWeather)
+    const displayNotes = getDisplayNotes(day)
+    const keyNotes = displayNotes.slice(0, 2)
     return (
       <article key={day.day} className="day-card">
         <div className="day-card-head">
           <strong>Day {day.day}</strong>
           <span>{day.anchor_city || '当天城市'} · {day.route_segment || '按当日景点顺序串联'}</span>
           <em>{getStageLabel(day.stage)}</em>
+          <em className={`weather-stage-badge ${tone}`}>{badge}</em>
         </div>
         <div className={`weather-chip-row ${tone}`}>
           <strong>{badge}</strong>
-          <span>{weatherDay ? formatWeatherDay(weatherDay, isFallbackWeather) : day.weather_summary || '天气待确认'}</span>
-          <small>{day.weather_summary || (isFallbackWeather ? '保留雨具、防晒和补水用品作为备选' : weatherDay?.strategy)}</small>
+          {isFallbackWeather ? (
+            <>
+              <span>{day.anchor_city || weatherDay?.city || '目的地'} · 未获取实时天气</span>
+              <small>本日不做天气重排</small>
+            </>
+          ) : (
+            <>
+              <span>{weatherDay ? formatWeatherDay(weatherDay, false) : day.weather_summary || '天气参考'}</span>
+              <small>{day.weather_summary || weatherDay?.strategy}</small>
+            </>
+          )}
         </div>
-        {(weatherTips.length || day.weather_adjustments?.length) ? (
+        {isFallbackWeather ? (
+          <p className="fallback-equipment-line">备选装备：雨具 / 防晒 / 水杯</p>
+        ) : (weatherTips.length || day.weather_adjustments?.length) ? (
           <div className="weather-tip-panel">
             <ul className="weather-tip-list">
               {dedupeStrings([...(day.weather_adjustments || []), ...weatherTips]).slice(0, 4).map((tip) => <li key={tip}>{tip}</li>)}
             </ul>
           </div>
         ) : null}
-        {packingTips.length ? (
+        {!isFallbackWeather && packingTips.length ? (
           <div className="packing-chip-row">
             {packingTips.slice(0, 8).map((tip) => <span key={tip}>{tip}</span>)}
           </div>
@@ -519,13 +554,21 @@ function PlanCard({ plan }: { plan: TravelPlanResponse }) {
             {dedupeStrings(day.recommendation_reasons).slice(0, 3).map((reason) => <li key={reason}>{reason}</li>)}
           </ul>
         ) : null}
-        {day.meals?.length ? <p><b>餐饮：</b>{dedupeStrings(day.meals).join(' ')}</p> : null}
-        {day.hotel_hint ? <p><b>住宿：</b>{day.hotel_hint}</p> : null}
-        {getDisplayNotes(day).length ? (
+        {keyNotes.length ? (
           <div className="note-row">
-            {getDisplayNotes(day).map((note) => <span key={note}>{note}</span>)}
+            {keyNotes.map((note) => <span key={note}>{note}</span>)}
           </div>
         ) : null}
+        <details className="day-details">
+          <summary>餐饮、住宿与完整调度说明</summary>
+          {day.meals?.length ? <p><b>餐饮：</b>{dedupeStrings(day.meals).join(' ')}</p> : null}
+          {day.hotel_hint ? <p><b>住宿：</b>{day.hotel_hint}</p> : null}
+          {displayNotes.length ? (
+            <div className="note-row">
+              {displayNotes.map((note) => <span key={note}>{note}</span>)}
+            </div>
+          ) : null}
+        </details>
       </article>
     )
   }
@@ -639,7 +682,7 @@ function PlanCard({ plan }: { plan: TravelPlanResponse }) {
 
       {activeTab === 'debug' ? (
         <div className="tab-panel">
-          <details className="debug-details" open>
+          <details className="debug-details">
             <summary>调试信息</summary>
             <div className="debug-grid">
               <div><span>记忆状态</span><strong>{memoryLabel}</strong></div>
@@ -651,6 +694,66 @@ function PlanCard({ plan }: { plan: TravelPlanResponse }) {
           </details>
         </div>
       ) : null}
+    </div>
+  )
+}
+
+function WeatherCard({ weather }: { weather: WeatherQueryData }) {
+  const connected = Boolean(weather.connected)
+  const dailyWeather = Array.isArray(weather.daily_weather) ? weather.daily_weather : []
+  const weatherTips = dedupeStrings(weather.weather_tips)
+  const packingTips = dedupeStrings(weather.packing_tips)
+  const statusTone = connected ? 'connected' : 'fallback'
+  return (
+    <div className="weather-card">
+      <div className="plan-hero">
+        <div>
+          <h3>天气查询 / 天气接口诊断</h3>
+          <p>{weather.summary || '暂未获取天气摘要'}</p>
+        </div>
+        <span className={`status-badge weather-status ${statusTone}`}>{connected ? '腾讯天气已接通' : '未接通 fallback'}</span>
+      </div>
+
+      <div className="plan-meta-grid">
+        <div><span>城市</span><strong>{weather.city || '--'}</strong></div>
+        <div><span>adcode</span><strong>{weather.adcode || '--'}</strong></div>
+        <div><span>数据来源</span><strong>{weather.data_source || '--'}</strong></div>
+        <div><span>失败原因</span><strong>{weather.fallback_reason || '--'}</strong></div>
+      </div>
+
+      {dailyWeather.length ? (
+        <div className="weather-daily-list">
+          {dailyWeather.map((day) => {
+            const tone = getWeatherTone(undefined, day.weather_tags, day.data_source !== 'tencent_maps')
+            return (
+              <div key={`${day.day}-${day.city}`} className={`weather-day-row ${tone}`}>
+                <strong>第{day.day || '?'}天</strong>
+                <span>{day.city || weather.city} · {day.weather || '天气待确认'} · {day.temperature || '温度待确认'}</span>
+                <small>{day.strategy || day.fallback_reason || '按实时天气微调'}</small>
+              </div>
+            )
+          })}
+        </div>
+      ) : null}
+
+      {weatherTips.length ? (
+        <div className="plan-section">
+          <h4>天气建议</h4>
+          <ul>{weatherTips.map((item) => <li key={item}>{item}</li>)}</ul>
+        </div>
+      ) : null}
+
+      {packingTips.length ? (
+        <div className="plan-section">
+          <h4>装备建议</h4>
+          <div className="packing-chip-row">{packingTips.map((item) => <span key={item}>{item}</span>)}</div>
+        </div>
+      ) : null}
+
+      <details className="debug-details">
+        <summary>调试信息</summary>
+        <pre>{JSON.stringify({ debug: weather.debug, memory: weather.response_meta?.memory }, null, 2)}</pre>
+      </details>
     </div>
   )
 }
@@ -684,6 +787,7 @@ export default function App() {
   const [audioDebug, setAudioDebug] = useState<AudioDebugPanel | null>(null)
   const [lastAudioDebugText, setLastAudioDebugText] = useState('')
   const [result, setResult] = useState<TravelPlanResponse | null>(null)
+  const [weatherResult, setWeatherResult] = useState<WeatherQueryData | null>(null)
   const [history, setHistory] = useState<ConversationTurn[]>(() => {
     try {
       return normalizeHistory(JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]'))
@@ -789,9 +893,11 @@ export default function App() {
     const answerType = data.answer_type || 'general_chat'
     const travelPlan = normalizeTravelPlan(data.data?.travel_plan)
     const nearby = data.data?.nearby
+    const weather = data.data?.weather
 
     if (answerType === 'nearby_search') {
       setResult(null)
+      setWeatherResult(null)
       const hotels = nearby?.hotel_candidates?.length
         ? `酒店：${nearby.hotel_candidates.slice(0, 3).map((item) => `${item.name}${item.address ? `（${item.address}）` : item.location ? `（${item.location}）` : ''}`).join('；')}`
         : '酒店：没有'
@@ -805,10 +911,16 @@ export default function App() {
       setMessages((prev) => [...prev, { role: 'assistant', content: nearbyText }])
     } else if (answerType === 'travel_planning' && travelPlan) {
       setResult({ ...travelPlan, response_meta: data.meta })
+      setWeatherResult(null)
       setHistory(travelPlan.history || [])
       setMessages((prev) => [...prev, { role: 'assistant', content: data.final_answer || travelPlan.summary || '暂无结果' }])
+    } else if (answerType === 'weather_query' && weather) {
+      setResult(null)
+      setWeatherResult({ ...weather, response_meta: data.meta })
+      setMessages((prev) => [...prev, { role: 'assistant', content: data.final_answer || weather.summary || '暂无天气结果' }])
     } else {
       setResult(null)
+      setWeatherResult(null)
       setMessages((prev) => [...prev, { role: 'assistant', content: data.final_answer || '暂无结果' }])
     }
   }
@@ -871,6 +983,7 @@ export default function App() {
     } catch (err) {
       setError(err instanceof Error ? err.message : '未知错误')
       setResult(null)
+      setWeatherResult(null)
     } finally {
       setLoading(false)
     }
@@ -905,12 +1018,14 @@ export default function App() {
       const data = normalizeTravelPlan(await response.json())
       if (!data) throw new Error('旅行规划结果格式无效')
       setResult(data)
+      setWeatherResult(null)
       setConversationId(data.conversation_id || '')
       setHistory(data.history || [])
       setMessages((prev) => [...prev, { role: 'assistant', content: data.summary }])
     } catch (err) {
       setError(err instanceof Error ? err.message : '未知错误')
       setResult(null)
+      setWeatherResult(null)
     } finally {
       setLoading(false)
     }
@@ -924,6 +1039,7 @@ export default function App() {
   const resetAll = () => {
     setMessages([])
     setResult(null)
+    setWeatherResult(null)
     setHistory([])
     setConversationId('')
     setUpload(null)
@@ -1030,7 +1146,7 @@ export default function App() {
                 <p className="empty-state">暂无历史记录</p>
               ) : history.map((item, index) => (
                 <button key={`${item.user_input}-${index}`} className="history-item" onClick={() => applyHistory(item)}>
-                  <strong>{item.user_input}</strong>
+                  <strong>{formatHistoryTitle(item.user_input)}</strong>
                   <span>{item.assistant_output}</span>
                 </button>
               ))}
@@ -1136,7 +1252,13 @@ export default function App() {
               <span className="muted">统一结果展示</span>
             </div>
 
-            {result ? <PlanCard plan={result} /> : <div className="empty-state">还没有生成结果，先在左侧提交出行天数、预算、目的地和偏好。</div>}
+            {weatherResult ? (
+              <WeatherCard weather={weatherResult} />
+            ) : result ? (
+              <PlanCard plan={result} />
+            ) : (
+              <div className="empty-state">还没有生成结果，先在左侧提交出行天数、预算、目的地和偏好，或直接询问“杭州天气”。</div>
+            )}
           </section>
         </aside>
       </main>

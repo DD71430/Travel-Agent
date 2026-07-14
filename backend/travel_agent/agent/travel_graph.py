@@ -23,6 +23,7 @@ from travel_agent.services.travel_planner import (
 )
 from travel_agent.services.trip_profile_service import build_trip_profile, decide_trip_type
 from travel_agent.services.weather_service import build_weather_context
+from travel_agent.services.weather_query_service import build_weather_query_response
 
 settings = get_settings()
 
@@ -206,6 +207,13 @@ async def _build_nearby(state: UnifiedAgentState) -> UnifiedAgentState:
     return {**state, 'answer_type': response['answer_type'], 'final_answer': response['final_answer'], 'data': response['data'], 'meta': response['meta'], 'error': response['error'], 'response': response}
 
 
+async def _build_weather_query(state: UnifiedAgentState) -> UnifiedAgentState:
+    response = await asyncio.to_thread(build_weather_query_response, state['request'])
+    response['upload_context'] = state.get('upload_context')
+    response['meta'] = _meta_with_notes(response.get('meta'), state.get('processing_notes', []))
+    return {**state, 'answer_type': response['answer_type'], 'final_answer': response['final_answer'], 'data': response['data'], 'meta': response['meta'], 'error': response['error'], 'response': response}
+
+
 async def _build_general(state: UnifiedAgentState) -> UnifiedAgentState:
     response = build_general_response(state['request'])
     response['upload_context'] = state.get('upload_context')
@@ -258,11 +266,12 @@ def build_unified_graph():
     graph.add_node('build_daily_itinerary', _build_daily_itinerary_node)
     graph.add_node('finalize_response', _finalize_travel_response)
     graph.add_node('build_nearby', _build_nearby)
+    graph.add_node('build_weather_query', _build_weather_query)
     graph.add_node('build_general', _build_general)
     graph.add_node('repair_travel', _repair_travel)
     graph.set_entry_point('ensure_request')
     graph.add_edge('ensure_request', 'classify')
-    graph.add_conditional_edges('classify', _after_classify, {'travel_planning': 'prepare_travel_request', 'nearby_search': 'build_nearby', 'general_chat': 'build_general'})
+    graph.add_conditional_edges('classify', _after_classify, {'travel_planning': 'prepare_travel_request', 'nearby_search': 'build_nearby', 'weather_query': 'build_weather_query', 'general_chat': 'build_general'})
     graph.add_edge('prepare_travel_request', 'extract_trip_profile')
     graph.add_edge('extract_trip_profile', 'fetch_route_options')
     graph.add_edge('fetch_route_options', 'build_route_context')
@@ -275,6 +284,7 @@ def build_unified_graph():
     graph.add_conditional_edges('finalize_response', _after_travel_reflect, {'repair_travel': 'repair_travel', 'end': END})
     graph.add_edge('repair_travel', END)
     graph.add_edge('build_nearby', END)
+    graph.add_edge('build_weather_query', END)
     graph.add_edge('build_general', END)
     return _AsyncGraphRunner(graph.compile())
 

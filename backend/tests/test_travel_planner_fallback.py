@@ -517,6 +517,21 @@ def test_fallback_weather_tips_stay_optional_not_deterministic(monkeypatch):
     assert '今天高温' not in combined
 
 
+def test_fallback_weather_daily_plan_does_not_repeat_unconfirmed_copy(monkeypatch):
+    monkeypatch.setattr(travel_planner.settings, 'tencent_maps_key', '')
+    monkeypatch.setattr(travel_planner._client, 'key', '')
+
+    request = build_travel_request(ChatRequest(question='从济南自驾到杭州三天两晚，在徐州停留一天，剩余时间在杭州游玩'))
+
+    plan = travel_planner.build_travel_plan(request)
+
+    first_day = plan.daily_itinerary[0]
+    visible_weather_text = ' '.join([first_day.weather_summary, first_day.weather_strategy or '', *first_day.weather_adjustments, *first_day.weather_tips, *first_day.notes])
+    assert visible_weather_text.count('天气待确认') <= 1
+    assert len(first_day.weather_adjustments) <= 1
+    assert plan.raw_route['weather_context']['request_debug']['fallback_reason']
+
+
 def test_daily_notes_do_not_duplicate_meals_hotels_or_reasons(monkeypatch):
     monkeypatch.setattr(travel_planner.settings, 'tencent_maps_key', '')
     monkeypatch.setattr(travel_planner._client, 'key', '')

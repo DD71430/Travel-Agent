@@ -58,7 +58,7 @@ select:focus {
 
 .app-shell {
   min-height: 100vh;
-  max-width: 1600px;
+  max-width: 1760px;
   margin: 0 auto;
   padding: 24px;
 }
@@ -145,7 +145,7 @@ select:focus {
 
 .workspace {
   display: grid;
-  grid-template-columns: minmax(260px, 20%) minmax(0, 50%) minmax(300px, 30%);
+  grid-template-columns: 300px minmax(420px, 0.8fr) minmax(620px, 1.2fr);
   gap: 16px;
   align-items: start;
 }
@@ -242,10 +242,25 @@ select:focus {
   padding: 14px;
   display: grid;
   gap: 6px;
+  max-height: 132px;
+  overflow: hidden;
 }
 
 .history-item strong {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 1;
   font-size: 14px;
+}
+
+.history-item span {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .history-item span,
@@ -303,6 +318,11 @@ select:focus {
 }
 
 .plan-card {
+  display: grid;
+  gap: 16px;
+}
+
+.weather-card {
   display: grid;
   gap: 16px;
 }
@@ -516,6 +536,30 @@ select:focus {
   padding: 4px 9px;
 }
 
+.day-card-head .weather-stage-badge {
+  background: #f7faf7;
+  border-color: var(--line);
+  color: #46564f;
+}
+
+.day-card-head .weather-stage-badge.rain {
+  background: #eff6ff;
+  border-color: #bfdbfe;
+  color: var(--rain);
+}
+
+.day-card-head .weather-stage-badge.heat {
+  background: #fff7ed;
+  border-color: #fed7aa;
+  color: var(--heat);
+}
+
+.day-card-head .weather-stage-badge.fallback {
+  background: #eef4f7;
+  border-color: #d6e1e7;
+  color: #475569;
+}
+
 .weather-chip-row {
   display: flex;
   flex-wrap: wrap;
@@ -571,6 +615,17 @@ select:focus {
   color: #475569;
 }
 
+.fallback-equipment-line {
+  margin: 0;
+  border: 1px dashed #d6e1e7;
+  border-radius: 8px;
+  background: #fbfcfa;
+  color: #475569 !important;
+  font-size: 13px;
+  font-weight: 700;
+  padding: 9px 11px;
+}
+
 .weather-tip-panel {
   background: #f7faf7;
   border: 1px solid var(--line);
@@ -617,6 +672,28 @@ select:focus {
   border-radius: 8px;
   font-size: 12px;
   overflow-wrap: anywhere;
+}
+
+.day-details {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfa;
+  padding: 10px 12px;
+}
+
+.day-details summary {
+  cursor: pointer;
+  color: #46564f;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.day-details p {
+  margin: 10px 0 0;
+}
+
+.day-details .note-row {
+  margin-top: 10px;
 }
 
 .day-route-meta {
@@ -722,6 +799,81 @@ select:focus {
   font-weight: 600;
 }
 
+.weather-status.connected {
+  background: #e7f4ef;
+  color: var(--primary-strong);
+}
+
+.weather-status.fallback {
+  background: #eef4f7;
+  color: #475569;
+}
+
+.weather-daily-list {
+  display: grid;
+  gap: 10px;
+}
+
+.weather-day-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 6px 12px;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f7faf7;
+  padding: 12px;
+}
+
+.weather-day-row strong {
+  grid-row: span 2;
+  border-radius: 8px;
+  background: #e7f4ef;
+  color: var(--primary-strong);
+  padding: 6px 9px;
+}
+
+.weather-day-row span {
+  color: #24354e;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.weather-day-row small {
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.weather-day-row.rain {
+  background: #eff6ff;
+  border-color: #bfdbfe;
+}
+
+.weather-day-row.rain strong {
+  background: #dbeafe;
+  color: var(--rain);
+}
+
+.weather-day-row.heat {
+  background: #fff7ed;
+  border-color: #fed7aa;
+}
+
+.weather-day-row.heat strong {
+  background: #ffedd5;
+  color: var(--heat);
+}
+
+.weather-day-row.fallback {
+  background: #eef4f7;
+  border-color: #d6e1e7;
+}
+
+.weather-day-row.fallback strong {
+  background: #e2e8f0;
+  color: #475569;
+}
+
 .empty-state {
   color: var(--muted);
   text-align: center;
@@ -763,5 +915,14 @@ select:focus {
 
   .result-tabs {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .weather-day-row {
+    grid-template-columns: 1fr;
+  }
+
+  .weather-day-row strong {
+    grid-row: auto;
+    width: fit-content;
   }
 }

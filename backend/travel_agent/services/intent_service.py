@@ -163,9 +163,22 @@ def looks_like_general_chat(question: str) -> bool:
     return len(cleaned) <= 80
 
 
-def classify_chat_intent(question: str) -> Literal['general_chat', 'travel_planning', 'nearby_search']:
-    if looks_like_general_chat(question):
-        return 'general_chat'
+def _looks_like_weather_query(question: str) -> bool:
+    source = question or ''
+    if not source.strip():
+        return False
+    if any(keyword in source for keyword in ('天气接口', '腾讯天气', '查天气')):
+        return True
+    weather_markers = ('天气', '气温', '下雨', '降雨', '高温', '暴雨', '雷阵雨')
+    if not any(marker in source for marker in weather_markers):
+        return False
+    planning_markers = (*_TRAVEL_NOISE_WORDS, '路线', '路书', '攻略', '怎么去', '怎么走', '出发', '目的地', '途经', '一日游', '两天一晚', '三天两晚')
+    if any(marker in source for marker in planning_markers):
+        return False
+    return True
+
+
+def classify_chat_intent(question: str) -> Literal['general_chat', 'travel_planning', 'nearby_search', 'weather_query']:
     parsed_origin, parsed_destination = extract_locations(question)
     trip_details = extract_trip_details(question)
     travel_markers = (*_TRAVEL_NOISE_WORDS, '路线', '路书', '攻略', '怎么去', '怎么走', '出发', '目的地', '途经', '一日游', '两天一晚', '三天两晚', '经典景点', '游览节奏')
@@ -176,6 +189,10 @@ def classify_chat_intent(question: str) -> Literal['general_chat', 'travel_plann
     nearby_target_markers = ('酒店', '餐厅', '美食', '景点', '博物馆', '公园', '商场', '推荐', '民宿', '宾馆')
     if any(keyword in question for keyword in NEARBY_KEYWORDS) and any(keyword in question for keyword in nearby_target_markers):
         return 'nearby_search'
+    if _looks_like_weather_query(question):
+        return 'weather_query'
+    if looks_like_general_chat(question):
+        return 'general_chat'
     if any(trip_details.values()):
         return 'travel_planning'
     if any(keyword in question for keyword in travel_markers):
