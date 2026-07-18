@@ -1,6 +1,13 @@
 from datetime import date, timedelta
 
-from travel_agent.services.weather_service import build_weather_context, build_weather_plan_summary, build_weather_tips, classify_weather_suitability, extract_tencent_weather_days
+from travel_agent.services.weather_service import (
+    build_weather_context,
+    build_weather_plan_summary,
+    build_weather_tips,
+    classify_weather_suitability,
+    extract_tencent_weather_days,
+    weather_badge_for_day,
+)
 
 
 def test_classify_rain_prioritizes_indoor():
@@ -19,6 +26,18 @@ def test_classify_sunny_weather_as_outdoor_good():
     result = classify_weather_suitability('晴')
     assert result['outdoor_suitability'] == 'good'
     assert result['indoor_priority'] is False
+
+
+def test_weather_badge_uses_weather_condition_for_resolved_low_risk_weather():
+    weather_day = {
+        'data_source': 'tencent_maps',
+        'weather': '阴',
+        'temperature': '23-29℃',
+        'outdoor_suitability': 'good',
+        'risk_level': 'low',
+        'weather_tags': ['weather_normal'],
+    }
+    assert weather_badge_for_day({'data_source': 'tencent_maps'}, weather_day) == '阴天'
 
 
 def test_classify_high_temperature_avoids_midday_outdoor():
@@ -247,6 +266,26 @@ def test_weather_plan_summary_for_fallback_stays_optional():
     assert '今天下雨' not in combined
     assert '今天高温' not in combined
     assert '雨天优先室内' not in combined
+
+
+def test_weather_plan_summary_reports_partial_day_coverage():
+    summary = build_weather_plan_summary(
+        {
+            'data_source': 'mixed',
+            'daily_weather': [
+                {'day': 1, 'city': '徐州', 'weather': '小雨', 'temperature': '26-34℃', 'data_source': 'tencent_maps'},
+                {'day': 2, 'city': '杭州', 'weather': '多云', 'temperature': '29-38℃', 'data_source': 'tencent_maps'},
+                {'day': 3, 'city': '杭州', 'weather': '小雨转多云', 'temperature': '29-38℃', 'data_source': 'tencent_maps'},
+                {'day': 4, 'city': '杭州', 'weather': '小雨转多云', 'temperature': '27-37℃', 'data_source': 'tencent_maps'},
+                {'day': 5, 'city': '杭州', 'weather': '天气待确认', 'temperature': '温度待确认', 'data_source': 'fallback'},
+            ],
+        },
+        [],
+    )
+
+    assert '第5天' in summary['weather_overview']
+    assert '待确认' in summary['weather_overview']
+    assert '已覆盖5天每日天气卡片' not in summary['weather_overview']
 
 
 def test_weather_context_uses_route_stop_adcodes_per_day(monkeypatch):

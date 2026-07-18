@@ -15,8 +15,8 @@ _LOCATION_PATTERNS = [
 ]
 
 _SCENARIO_KEYWORDS = {
-    'travel_tourism': ('旅游', '景区', '酒店', '周末', '度假', '游玩', '景点'),
-    'daily_commute': ('上班', '通勤', '公司', '地铁', '回家'),
+    'travel_tourism': ('旅游', '旅行', '旅行方案', '旅游规划', '景区', '酒店', '住宿', '餐厅', '周末', '度假', '游玩', '景点', '行程', '必去'),
+    'daily_commute': ('上班', '通勤', '公司', '上学'),
     'navigation': ('怎么走', '路线', '出行', '规划', '前往', '到'),
 }
 
@@ -43,6 +43,8 @@ def _extract_location_entities(question: str) -> dict[str, str]:
 
 def _infer_scenario(question: str, image_context: dict | None = None) -> str:
     text = f'{question} {image_context or {}}'
+    if re.search(r'(\d+|[一二两三四五六七八九十]+)\s*天\s*(\d+|[一二两三四五六七八九十]+)?\s*晚', text):
+        return 'travel_tourism'
     for scenario, keywords in _SCENARIO_KEYWORDS.items():
         if any(keyword in text for keyword in keywords):
             return scenario

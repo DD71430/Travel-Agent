@@ -255,8 +255,8 @@ def build_nearby_response(request: ChatRequest) -> dict:
         debug['search_error'] = 'nearby_search_failed'
     attraction_recommendations = [f"{item['name']}（{item['address']}）" if item.get('address') else item['name'] for item in pois]
     debug.update({'hotel_count': len(hotel_candidates), 'food_count': len(food_candidates), 'poi_count': len(pois)})
-    hotel_preview = '；'.join(f"{item.get('name')}{f'（{item.get('address')}）' if item.get('address') else ''}" for item in hotel_candidates[:3] if item.get('name'))
-    food_preview = '；'.join(f"{item.get('name')}{f'（{item.get('address')}）' if item.get('address') else ''}" for item in food_candidates[:3] if item.get('name'))
+    hotel_preview = '；'.join(f"{item.get('name')}（{item.get('address')}）" if item.get('address') else str(item.get('name')) for item in hotel_candidates[:3] if item.get('name'))
+    food_preview = '；'.join(f"{item.get('name')}（{item.get('address')}）" if item.get('address') else str(item.get('name')) for item in food_candidates[:3] if item.get('name'))
     poi_preview = '；'.join(attraction_recommendations[:4])
     safe_debug = _debug_payload(debug)
     nearby_data = {

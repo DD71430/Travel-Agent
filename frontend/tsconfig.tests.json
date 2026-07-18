@@ -8,13 +8,17 @@
     "moduleResolution": "NodeNext"
   },
   "include": [
+    "src/vite-env.d.ts",
     "src/weatherDisplay.ts",
     "src/planDisplay.ts",
     "src/chatUi.ts",
     "src/SidebarPanel.tsx",
+    "src/types.ts",
+    "src/components/*.tsx",
     "tests/weatherDisplay.test.ts",
     "tests/planDisplay.test.ts",
     "tests/chatUi.test.ts",
-    "tests/SidebarPanel.test.tsx"
+    "tests/SidebarPanel.test.tsx",
+    "tests/components.test.tsx"
   ]
 }

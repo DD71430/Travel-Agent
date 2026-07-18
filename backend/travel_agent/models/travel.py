@@ -16,7 +16,7 @@ class TravelPlanRequest(BaseModel):
     destination: str = Field(..., description='目的地')
     travel_mode: Literal['driving', 'walking', 'transit', 'bicycling'] = 'driving'
     preferences: Optional[str] = Field(default=None, description='日常出行或旅行偏好')
-    source_query: Optional[str] = Field(default=None, description='用户原始输入，用于提取天数、预算等旅行信息')
+    source_query: Optional[str] = Field(default=None, description='用户原始输入，用于提取天数、交通和旅行偏好等信息')
     conversation_id: Optional[str] = Field(default=None, description='会话 ID，用于多轮对话记忆')
     waypoints: list[Waypoint] = Field(default_factory=list, description='途经点列表')
     waypoint_order: bool = Field(default=False, description='是否让服务端智能排序途经点')
@@ -85,6 +85,8 @@ class TripDayPlan(BaseModel):
     afternoon: str
     evening: str
     attractions: list[dict[str, str]] = Field(default_factory=list)
+    backup_attractions: list[dict[str, str]] = Field(default_factory=list)
+    reservation_tips: list[str] = Field(default_factory=list)
     meals: list[str] = Field(default_factory=list)
     hotel_hint: str | None = None
     recommendation_reasons: list[str] = Field(default_factory=list)
@@ -108,7 +110,7 @@ class TravelPlanResponse(BaseModel):
     route_total_distance: str = ''
     trip_overview: str = ''
     duration_days: int = 3
-    budget_estimate: str = '待估算'
+    budget_estimate: str = ''
     accommodation_suggestion: str = ''
     transportation_suggestion: list[str] = Field(default_factory=list)
     weather_hint: str = ''

@@ -32,8 +32,6 @@ def build_preference_summary(
     if transport_modes:
         parts.append(f'跨城交通：{transport_modes.get("intercity_label") or transport_modes.get("intercity_mode")}')
         parts.append(f'市内交通：{transport_modes.get("local_label") or transport_modes.get("local_mode")}')
-    if trip_details.get('budget'):
-        parts.append(f'预算：{trip_details["budget"]}元')
     if trip_details.get('duration_days') and duration_source in {'explicit_duration', 'explicit_total'}:
         parts.append(f'行程时长：{trip_details["duration_days"]}天')
     if trip_details.get('nights'):
@@ -109,7 +107,7 @@ def build_travel_request(request: ChatRequest) -> TravelPlanRequest:
     trip_profile = {
         'duration_days': parsed_profile.get('duration_days') or (int(trip_details['duration_days']) if trip_details['duration_days'] else None),
         'nights': parsed_profile.get('nights'),
-        'budget': trip_details['budget'],
+        'budget': None,
         'travel_style': '轻松慢游' if any(word in merged_preference_text for word in ('轻松', '慢游', '休闲', '不赶')) else '常规游玩',
         'companions': '家庭/朋友' if any(word in merged_preference_text for word in ('家人', '家庭', '朋友', '亲子')) else '默认',
         'interest_tags': parsed_profile.get('interest_tags', []),

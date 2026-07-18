@@ -5,6 +5,7 @@ from typing import Any, Literal
 
 from travel_agent.models.travel import TravelPlanRequest
 from travel_agent.services.intent_service import extract_locations, extract_question_waypoints, extract_travel_mode, extract_trip_details
+from travel_agent.services.location_text_service import strip_stopover_action_suffix
 
 TripType = Literal['destination_trip', 'along_route_trip', 'commute', 'nearby_search', 'general_chat']
 
@@ -121,8 +122,9 @@ def _add_route_stop(
     must_visit: bool = False,
     source: str = 'parsed_stopover',
 ) -> None:
-    cleaned = re.sub(r'(停留|游玩|玩|住|住宿|看看|参观).*$', '', name.strip(' ，。；;、'))
-    cleaned = re.sub(r'^(中途|途中|路上|沿途)?(?:在|到|去)', '', cleaned)
+    cleaned = strip_stopover_action_suffix(name.strip(' ，。；;、'))
+    cleaned = re.sub(r'^(中途|途中|路上|沿途)?(?:在|到|去|途经|经过|路过)', '', cleaned)
+    cleaned = strip_stopover_action_suffix(cleaned)
     cleaned = re.sub(r'(半天|一晚|\d+\s*[天晚]|[一二两三四五六七八九十]+\s*[天晚]).*$', '', cleaned).strip(' ，。；;、')
     if cleaned in {'中途', '途中', '路上', '沿途', '目的地', '剩余时间', '余下时间'}:
         return
@@ -158,8 +160,8 @@ def parse_route_stops(text: str | None, *, destination: str | None = None) -> li
     source = text or ''
     stops: list[dict[str, Any]] = []
     stopover_patterns = (
-        r'(?:(?:中途|途中|路上|沿途)?在|途经|路过|经过)(?P<name>[^，。；,、和及]{2,12}?)(?P<action>停留|游玩|玩|住宿|住)(?P<num>半|\d+|[一二两三四五六七八九十]+)?\s*(?P<unit>半天|天|晚|一晚)?',
-        r'(?P<name>[^，。；,、和及]{2,12}?)(?P<action>停留|游玩|玩|住宿|住)(?P<num>半|\d+|[一二两三四五六七八九十]+)?\s*(?P<unit>半天|天|晚|一晚)',
+        r'(?:(?:中途|途中|路上|沿途)?在|途经|路过|经过)(?P<name>[^，。；,、和及]{2,12}?)(?:并且?|且)?(?P<action>停留|游玩|玩|住宿|住)(?P<num>半|\d+|[一二两三四五六七八九十]+)?\s*(?P<unit>半天|天|晚|一晚)?',
+        r'(?P<name>[^，。；,、和及]{2,12}?)(?:并且?|且)?(?P<action>停留|游玩|玩|住宿|住)(?P<num>半|\d+|[一二两三四五六七八九十]+)?\s*(?P<unit>半天|天|晚|一晚)',
     )
     for pattern in stopover_patterns:
         for match in re.finditer(pattern, source):
@@ -389,7 +391,7 @@ def build_trip_profile_from_text(text: str | None, *, origin: str | None = None,
         'travel_mode': mode,
         'duration_days': duration_days,
         'nights': nights,
-        'budget': trip_details.get('budget'),
+        'budget': None,
         'waypoints': extract_question_waypoints(source),
         'interest_tags': interest_tags,
         'avoid_tags': avoid_tags,

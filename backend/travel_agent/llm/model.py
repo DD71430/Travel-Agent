@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from backend.config.settings import get_settings
+from travel_agent.core.config import get_settings
 
 
 @dataclass(frozen=True)

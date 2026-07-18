@@ -4,6 +4,16 @@ from travel_agent.services.request_builder import build_travel_request
 from travel_agent.services import travel_planner
 
 
+COMPREHENSIVE_HANGZHOU_QUESTION = (
+    '帮我规划一个从济南出发到杭州的 5 天 4 晚旅行方案，乘高铁跨城，市内以地铁和打车为主。'
+    '途中希望在徐州停留 1 天，顺路去徐州博物馆和云龙湖；'
+    '到杭州后玩 3 天，必须安排西湖、浙江省博物馆、灵隐寺和河坊街。'
+    '同行有老人和一个小朋友，节奏轻松一点，少走路，不爬山，偏好历史文化、博物馆、经典景点和本地美食。'
+    '预算控制在 6000 元左右。请结合未来天气安排每天上午、下午、晚上行程，推荐每天附近餐厅和住宿区域，'
+    '并说明交通方式、天气调整、装备建议和哪些景点需要提前预约。'
+)
+
+
 def test_build_travel_plan_fallback_without_tencent_key(monkeypatch):
     monkeypatch.setattr(travel_planner.settings, 'tencent_maps_key', '')
     monkeypatch.setattr(travel_planner._client, 'key', '')
@@ -210,6 +220,24 @@ def test_high_speed_rail_plan_uses_transport_block_instead_of_driving_copy(monke
     assert '出站接驳' in first_day_text
     assert '驾驶' not in first_day_text
     assert any('高铁' in item for item in plan.transportation_suggestion)
+
+
+def test_high_speed_rail_summary_mentions_parsed_stopover_and_weather_targets(monkeypatch):
+    monkeypatch.setattr(travel_planner.settings, 'tencent_maps_key', '')
+    monkeypatch.setattr(travel_planner._client, 'key', '')
+    request = build_travel_request(
+        ChatRequest(question='帮我规划一个从济南到杭州三天两晚的旅行路线，要求乘坐高铁，在徐州游玩一天，剩余时间在杭州游玩，优先经典景点和合理游览节奏，请查询天气')
+    )
+
+    plan = travel_planner.build_travel_plan(request)
+
+    assert '途经安排：徐州' in plan.summary
+    assert plan.raw_route['weather_context']['request_debug']['weather_targets'][0]['city'] == '徐州'
+    scheduled_names = [item['name'] for day in plan.daily_itinerary for item in day.attractions]
+    assert any('徐州' in name for name in scheduled_names)
+    assert any('杭州' in name or name in {'西湖风景名胜区', '灵隐寺'} for name in scheduled_names)
+    for name in scheduled_names:
+        assert name in plan.attraction_recommendations
 
 
 def test_explicit_three_day_trip_repeats_two_day_stopover_before_destination(monkeypatch):
@@ -874,3 +902,78 @@ def test_build_travel_plan_arranges_must_visit_waypoints(monkeypatch):
     assert '龙门石窟' in route_stop_names
     assert '龙门石窟' in plan.raw_route['must_visit_attractions']
     assert '成都博物馆' in plan.raw_route['must_visit_attractions']
+
+
+def test_comprehensive_hangzhou_plan_keeps_must_visits_city_scope_and_transfer_day(monkeypatch):
+    monkeypatch.setattr(travel_planner.settings, 'tencent_maps_key', '')
+    monkeypatch.setattr(travel_planner._client, 'key', '')
+    request = build_travel_request(ChatRequest(question=COMPREHENSIVE_HANGZHOU_QUESTION))
+
+    plan = travel_planner.build_travel_plan(request)
+
+    assert plan.scenario == 'travel_tourism'
+    required = {'西湖', '浙江省博物馆', '灵隐寺', '河坊街'}
+    assert required.issubset(set(plan.raw_route['must_visit_attractions']))
+
+    scheduled_names = {item.get('name') for day in plan.daily_itinerary for item in day.attractions}
+    backup_names = {item.get('name') for day in plan.daily_itinerary for item in day.backup_attractions}
+    scheduled_or_unscheduled = scheduled_names | backup_names | set(plan.raw_route['unscheduled_waypoints'])
+    assert required.issubset(scheduled_or_unscheduled)
+
+    day1 = plan.daily_itinerary[0]
+    assert day1.anchor_city == '徐州'
+    day1_text = ' '.join(
+        [
+            *[item.get('name', '') for item in day1.attractions],
+            *[item.get('name', '') for item in day1.backup_attractions],
+            *day1.notes,
+            *plan.raw_route.get('unscheduled_waypoints', []),
+            *[item.get('name', '') for item in plan.raw_route.get('backup_waypoints', [])],
+        ]
+    )
+    assert '徐州博物馆' in day1_text
+    assert '云龙湖' in day1_text
+
+    destination_days = [day for day in plan.daily_itinerary[1:] if day.anchor_city == '杭州']
+    assert destination_days
+    for day in destination_days:
+        names = [item.get('name', '') for item in day.attractions]
+        assert not any('徐州' in name or '云龙湖' in name for name in names)
+
+    day2 = plan.daily_itinerary[1]
+    assert day2.route_segment == '徐州 → 杭州'
+    assert '15:' not in day1.morning
+    assert '14:' not in day2.morning
+    assert '徐州 → 杭州' in day2.morning or '高铁/动车跨城' in day2.morning or '跨城转场' in day2.morning
+    assert any(keyword in f'{day2.afternoon} {day2.evening}' for keyword in ('浙江省博物馆', '入住', '休整'))
+    assert not day2.morning.lstrip().startswith(('杭州博物馆', '西湖', '浙江省博物馆', '灵隐寺', '河坊街'))
+    assert len(day2.attractions) <= 2
+
+    stage_segments = plan.raw_route['stage_segments']
+    intercity_minutes = sum(
+        int((item.get('transport_block') or {}).get('total_minutes') or 0)
+        for item in stage_segments
+        if (item.get('transport_block') or {}).get('origin') != (item.get('transport_block') or {}).get('destination')
+    )
+    assert plan.raw_route['total_intercity_minutes'] >= intercity_minutes
+    assert plan.raw_route['total_transport_minutes'] >= intercity_minutes
+
+    reservation_text = ' '.join(plan.raw_route['reservation_tips'])
+    assert '浙江省博物馆' in reservation_text
+    assert '灵隐寺' in reservation_text
+    assert '西湖整体门票' not in reservation_text
+
+    assert '地铁' in plan.raw_route['trip_profile']['local_label']
+    assert '打车' in plan.raw_route['trip_profile']['local_label']
+    for day in plan.daily_itinerary:
+        combined_meals = ' '.join(day.meals)
+        attraction_names = [item.get('name', '') for item in day.attractions]
+        anchors = [day.anchor_city, *attraction_names]
+        assert day.meals
+        assert day.hotel_hint
+        assert any(anchor and anchor in combined_meals for anchor in anchors)
+        assert any(anchor and anchor in day.hotel_hint for anchor in anchors)
+    for day in destination_days:
+        names = [item.get('name', '') for item in day.attractions]
+        if len(names) > 2:
+            assert all(name in required for name in names)

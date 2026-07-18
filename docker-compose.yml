@@ -1,7 +1,9 @@
+name: travel_agent
+
 services:
   redis:
     image: redis:7-alpine
-    container_name: travel-agent-redis
+    container_name: travel_agent_redis
     ports:
       - "6379:6379"
     command: ["redis-server", "--appendonly", "yes"]
@@ -9,11 +11,12 @@ services:
       - redis-data:/data
     restart: unless-stopped
 
-  backend:
+  travel_agent_backend:
+    image: travel_agent_backend
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: travel-agent-backend
+    container_name: travel_agent_backend
     env_file:
       - ./.env
     environment:
@@ -26,13 +29,14 @@ services:
       - "8000:8000"
     restart: unless-stopped
 
-  frontend:
+  travel_agent_frontend:
+    image: travel_agent_frontend
     build:
       context: ./frontend
       dockerfile: Dockerfile
-    container_name: travel-agent-frontend
+    container_name: travel_agent_frontend
     depends_on:
-      - backend
+      - travel_agent_backend
     ports:
       - "5173:80"
     restart: unless-stopped

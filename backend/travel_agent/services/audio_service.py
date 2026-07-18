@@ -24,6 +24,15 @@ def ffmpeg_binary() -> str:
     for candidate in (Path(r'D:\ffmpeg\ffmpeg-8.1.2-essentials_build\bin\ffmpeg.exe'), Path(r'D:\ffmpeg\bin\ffmpeg.exe'), Path(r'C:\ffmpeg\bin\ffmpeg.exe')):
         if candidate.exists():
             return str(candidate)
+    try:
+        import imageio_ffmpeg
+
+        bundled = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        logger.debug('Failed to resolve bundled ffmpeg from imageio-ffmpeg', exc_info=True)
+    else:
+        if bundled and Path(bundled).exists():
+            return str(bundled)
     return 'ffmpeg'
 
 

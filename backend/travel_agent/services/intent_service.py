@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Literal
 
+from travel_agent.services.location_text_service import strip_stopover_action_suffix
+
 NEARBY_KEYWORDS = ('附近', '周边', '周围', '旁边', '临近', '靠近')
 CITY_HINTS = ('北京', '上海', '广州', '深圳', '杭州', '济南', '南京', '苏州', '成都', '重庆', '武汉', '西安', '天津', '青岛', '厦门', '长沙', '郑州', '合肥', '福州', '昆明', '哈尔滨', '大连', '宁波', '无锡', '佛山', '东莞', '烟台', '珠海', '南昌', '徐州', '泰安', '德州', '曲阜')
 
@@ -87,7 +89,6 @@ def extract_trip_details(text: str | None) -> dict[str, str | None]:
     source = text or ''
     duration_match = re.search(r'(\d+)\s*天', source)
     chinese_duration_match = re.search(r'([一二两三四五六七八九十]+)\s*天', source)
-    budget_match = re.search(r'预算\s*(\d+)|(?:总预算|花费|控制在)\s*(\d+)', source)
     nights_match = re.search(r'(\d+)\s*晚', source)
     chinese_nights_match = re.search(r'([一二两三四五六七八九十]+)\s*晚', source)
     duration_days = duration_match.group(1) if duration_match else None
@@ -98,7 +99,7 @@ def extract_trip_details(text: str | None) -> dict[str, str | None]:
     if not nights and chinese_nights_match:
         parsed = _parse_chinese_number(chinese_nights_match.group(1))
         nights = str(parsed) if parsed is not None else None
-    return {'duration_days': duration_days, 'budget': (budget_match.group(1) or budget_match.group(2)) if budget_match else None, 'nights': nights}
+    return {'duration_days': duration_days, 'budget': None, 'nights': nights}
 
 
 def extract_travel_mode(text: str | None, fallback: str | None = None) -> str:
@@ -141,7 +142,8 @@ def extract_question_waypoints(text: str | None) -> list[dict[str, str]]:
     for pattern in (r'途经(?P<items>[^，。；,]+)', r'顺路去(?P<items>[^，。；,]+)', r'中途想去(?P<items>[^，。；,]+)'):
         for match in re.finditer(pattern, source):
             for item in re.split(r'[和及、,，/]+', match.group('items')):
-                cleaned = re.sub(r'(看|去|逛|经过)$', '', item.strip()).strip()
+                cleaned = strip_stopover_action_suffix(item.strip())
+                cleaned = re.sub(r'(看|去|逛|经过)$', '', cleaned).strip()
                 if cleaned and len(cleaned) > 1 and not any(existing['name'] == cleaned for existing in waypoints):
                     waypoints.append({'name': cleaned})
     return waypoints[:5]

@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.test-dist/
+.vite/
+coverage/
+*.log
+.env
+.env.*

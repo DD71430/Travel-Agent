@@ -96,6 +96,7 @@ def weather_badge_for_day(weather_context: dict[str, Any], weather_day: dict[str
     day_source = str(weather_day.get('data_source') or weather_context.get('data_source') or '')
     if day_source != 'tencent_maps':
         return '天气待确认'
+    weather = str(weather_day.get('weather') or '')
     flags = _weather_flags(weather_day)
     if flags['has_extreme']:
         return '预警'
@@ -103,9 +104,19 @@ def weather_badge_for_day(weather_context: dict[str, Any], weather_day: dict[str
         return '雨天'
     if flags['has_extreme_heat'] or flags['has_heat']:
         return '高温'
-    if flags['has_sun']:
-        return '晴热'
-    return '天气参考'
+    if '雪' in weather:
+        return '雪天'
+    if '雾' in weather or '霾' in weather:
+        return '雾霾'
+    if '阴' in weather:
+        return '阴天'
+    if '多云' in weather or '少云' in weather:
+        return '多云'
+    if '晴' in weather:
+        return '晴天'
+    if str(weather_day.get('outdoor_suitability') or '') == 'good':
+        return '室外适合'
+    return '天气已查询'
 
 
 def build_daily_weather_brief(weather_context: dict[str, Any], weather_day: dict[str, Any] | None) -> str:
@@ -281,9 +292,17 @@ def build_weather_plan_summary(weather_context: dict[str, Any], daily_itinerary:
     rain_days = 0
     heat_days = 0
     extreme_days = 0
+    resolved_days = 0
+    unconfirmed_days: list[int] = []
     for item in daily_weather:
-        if str(item.get('data_source') or data_source) != 'tencent_maps':
+        item_source = str(item.get('data_source') or data_source)
+        weather_text = str(item.get('weather') or '')
+        day_number = int(item.get('day') or 0)
+        if item_source != 'tencent_maps' or '待确认' in weather_text or '未知' in weather_text:
+            if day_number:
+                unconfirmed_days.append(day_number)
             continue
+        resolved_days += 1
         flags = _weather_flags(item)
         if flags['has_rain']:
             rain_days += 1
@@ -306,7 +325,10 @@ def build_weather_plan_summary(weather_context: dict[str, Any], daily_itinerary:
         overview_parts.append('存在暴雨/雷暴等风险的日期已提示减少户外、关注预警')
     if not overview_parts:
         overview_parts.append(str(weather_context.get('summary') or '天气风险较低，按实时天气微调室内外顺序即可'))
-    if daily_itinerary:
+    if unconfirmed_days:
+        day_text = '、'.join(f'第{day}天' for day in _dedupe_text([str(day) for day in unconfirmed_days]))
+        overview_parts.append(f'已获取{resolved_days}天确定天气，{day_text}天气待确认，建议出行前复查')
+    elif daily_itinerary:
         overview_parts.append(f'已覆盖{len(daily_itinerary)}天每日天气卡片')
     return {
         'weather_overview': '；'.join(_dedupe_text(overview_parts)) + '。',
@@ -430,6 +452,24 @@ def _forecast_items_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]
     return items
 
 
+def _select_forecast_indices(forecasts: list[dict[str, Any]], days: int, forecast_offset: int) -> list[int]:
+    safe_offset = max(0, forecast_offset)
+    requested_days = max(0, days)
+    if requested_days <= 0:
+        return []
+    expected_dates = [(date.today() + timedelta(days=safe_offset + offset)).isoformat() for offset in range(requested_days)]
+    date_to_index: dict[str, int] = {}
+    for index, item in enumerate(forecasts):
+        if not isinstance(item, dict):
+            continue
+        forecast_date = _normalize_forecast_date(item.get('date'))
+        if forecast_date and forecast_date not in date_to_index:
+            date_to_index[forecast_date] = index
+    if expected_dates and all(expected_date in date_to_index for expected_date in expected_dates):
+        return [date_to_index[expected_date] for expected_date in expected_dates]
+    return [index for index in range(safe_offset, min(len(forecasts), safe_offset + requested_days))]
+
+
 def extract_tencent_weather_days(
     payload: dict[str, Any],
     city: str,
@@ -441,18 +481,8 @@ def extract_tencent_weather_days(
 ) -> list[dict[str, Any]]:
     forecasts = _forecast_items_from_payload(payload)
     daily: list[dict[str, Any]] = []
-    safe_offset = max(0, forecast_offset)
-    for offset in range(days):
-        expected_date = (date.today() + timedelta(days=safe_offset + offset)).isoformat()
-        dated_index = next(
-            (
-                item_index
-                for item_index, candidate in enumerate(forecasts)
-                if isinstance(candidate, dict) and _normalize_forecast_date(candidate.get('date')) == expected_date
-            ),
-            None,
-        )
-        forecast_index = dated_index if dated_index is not None else safe_offset + offset
+    selected_indices = _select_forecast_indices(forecasts, days, forecast_offset)
+    for offset, forecast_index in enumerate(selected_indices):
         if forecast_index >= len(forecasts):
             continue
         item = forecasts[forecast_index]

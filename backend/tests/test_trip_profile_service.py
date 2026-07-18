@@ -1,6 +1,6 @@
 from travel_agent.schemas.chat import ChatRequest
 from travel_agent.services.request_builder import build_travel_request
-from travel_agent.services.trip_profile_service import build_trip_profile, build_trip_profile_from_text, score_poi
+from travel_agent.services.trip_profile_service import build_trip_profile, build_trip_profile_from_text, parse_route_stops, score_poi
 
 
 def test_parse_along_route_trip_profile():
@@ -57,6 +57,19 @@ def test_parse_stopover_day_and_destination_remainder():
     assert profile['route_days'] >= 1
     assert profile['destination_days'] >= 1
     assert profile['destination_stay_days'] == profile['destination_days']
+
+
+def test_parse_stopover_with_connector_before_action():
+    question = '从杭州到济南三天两晚，乘坐高铁，途经徐州并停留一天'
+
+    stops = parse_route_stops(question, destination='济南')
+    profile = build_trip_profile_from_text(question, origin='杭州', destination='济南', travel_mode='transit')
+    stop_names = [stop['name'] for stop in stops]
+    profile_stop_names = [stop['name'] for stop in profile['route_stops']]
+
+    assert stop_names == ['徐州']
+    assert profile_stop_names == ['徐州']
+    assert not any('徐州并' in name or '途经徐州并' in name for name in profile_stop_names)
 
 
 def test_parse_stage_sum_when_route_and_destination_days_are_explicit():

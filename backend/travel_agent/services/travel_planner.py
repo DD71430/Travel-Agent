@@ -118,10 +118,29 @@ def _classify_intent(text: str) -> str:
 
 def _classify_scenario(request: TravelPlanRequest) -> str:
     combined = f"{request.origin}{request.destination}{request.preferences or ''}{request.source_query or ''}"
-    if any(word in combined for word in ('上班', '通勤', '公司', '地铁')):
-        return 'daily_commute'
-    if any(word in combined for word in ('旅游', '景区', '酒店', '周末', '度假', '几天', '天游', '行程')):
+    tourism_keywords = (
+        '旅游',
+        '旅行',
+        '旅行方案',
+        '旅游规划',
+        '景区',
+        '景点',
+        '酒店',
+        '住宿',
+        '餐厅',
+        '周末',
+        '度假',
+        '几天',
+        '天游',
+        '行程',
+        '必去',
+        '必打卡',
+    )
+    commute_keywords = ('上班', '通勤', '公司', '上学')
+    if any(word in combined for word in tourism_keywords) or re.search(r'(\d+|[一二两三四五六七八九十]+)\s*天\s*(\d+|[一二两三四五六七八九十]+)?\s*晚', combined):
         return 'travel_tourism'
+    if any(word in combined for word in commute_keywords):
+        return 'daily_commute'
     return 'general_trip'
 
 
@@ -991,13 +1010,14 @@ def build_stage_segments(request: TravelPlanRequest, profile: dict[str, Any], ro
             drive_minutes = 35
             segment_distance = 0
             local_mode = str(profile.get('local_mode') or request.travel_mode)
+            local_label = transport_mode_label(local_mode, local=True)
             transport_block = {
                 'mode': local_mode,
-                'label': transport_mode_label(local_mode, local=True),
+                'label': local_label,
                 'origin': target_name,
                 'destination': target_name,
                 'total_minutes': drive_minutes,
-                'summary': f'市内转场约{_format_duration_minutes(drive_minutes)}',
+                'summary': f'{local_label}接驳约{_format_duration_minutes(drive_minutes)}',
             }
             route_segment = f'{target_name}市内/周边'
         else:
@@ -1052,13 +1072,14 @@ def build_stage_segments(request: TravelPlanRequest, profile: dict[str, Any], ro
         else:
             drive_minutes = 45 if day == route_days + 1 else 30
             local_mode = str(profile.get('local_mode') or request.travel_mode)
+            local_label = transport_mode_label(local_mode, local=True)
             transport_block = {
                 'mode': local_mode,
-                'label': transport_mode_label(local_mode, local=True),
+                'label': local_label,
                 'origin': request.destination,
                 'destination': request.destination,
                 'total_minutes': drive_minutes,
-                'summary': f'市内转场约{_format_duration_minutes(drive_minutes)}',
+                'summary': f'{local_label}接驳约{_format_duration_minutes(drive_minutes)}',
             }
             route_segment = f'{request.destination}市内/周边'
         segments.append(
@@ -1101,7 +1122,7 @@ def build_stage_segments(request: TravelPlanRequest, profile: dict[str, Any], ro
                     'origin': request.destination,
                     'destination': request.destination,
                     'total_minutes': 60,
-                    'summary': '机动/返程缓冲约1小时',
+                    'summary': f'{transport_mode_label(str(profile.get("local_mode") or request.travel_mode), local=True)}机动/返程缓冲约1小时',
                 },
                 'data_source': 'fallback_estimated',
             }
@@ -1230,9 +1251,7 @@ def _extract_trip_profile(request: TravelPlanRequest) -> dict[str, Any]:
     source_text = request.source_query or ''
     text = source_text.strip()
     duration_match = re.search(r'(\d+)\s*天', text)
-    budget_match = re.search(r'(\d+)\s*元', text)
     nights_match = re.search(r'(\d+)\s*晚', text)
-    budget = budget_match.group(1) if budget_match else None
     days = int(duration_match.group(1)) if duration_match else None
     nights = int(nights_match.group(1)) if nights_match else None
     if days is None and nights is not None:
@@ -1246,18 +1265,13 @@ def _extract_trip_profile(request: TravelPlanRequest) -> dict[str, Any]:
             days = 4
         else:
             days = 3
-    if not budget:
-        if '5000' in text:
-            budget = '5000'
-        elif '3000' in text:
-            budget = '3000'
     base_profile = build_trip_profile(request)
     travel_style = str(base_profile.get('travel_style') or ('轻松慢游' if any(word in text for word in ('轻松', '慢游', '休闲', '不赶')) else '常规游玩'))
     companions = str(base_profile.get('companions') or ('家庭/朋友' if any(word in text for word in ('家人', '家庭', '朋友', '亲子')) else '默认'))
     return {
         'duration_days': int(base_profile.get('duration_days') or days),
         'nights': base_profile.get('nights') or nights,
-        'budget': base_profile.get('budget') or budget,
+        'budget': None,
         'travel_style': travel_style,
         'companions': companions,
         'interest_tags': base_profile.get('interest_tags', []),
@@ -1531,6 +1545,24 @@ def _build_transportation_suggestions(request: TravelPlanRequest, best_option: R
 
 
 
+def _summary_waypoint_text(request: TravelPlanRequest, profile: dict[str, Any]) -> str:
+    names: list[str] = []
+
+    def add_name(value: Any) -> None:
+        name = str(value or '').strip()
+        if name and name not in names and name != request.destination:
+            names.append(name)
+
+    for waypoint in request.waypoints:
+        add_name(waypoint.name)
+    for key in ('route_stops', 'waypoint_details'):
+        for item in profile.get(key) or []:
+            if isinstance(item, dict):
+                add_name(item.get('name'))
+
+    return '、'.join(names) if names else '无途经点'
+
+
 def _build_summary(
     request: TravelPlanRequest,
     option: RouteOption,
@@ -1543,8 +1575,8 @@ def _build_summary(
     food_candidates: list[dict[str, str]] | None = None,
 ) -> str:
     preference_text = request.preferences or '没有额外偏好'
-    waypoint_text = '、'.join(w.name for w in request.waypoints) if request.waypoints else '无途经点'
     profile = _extract_trip_profile(request)
+    waypoint_text = _summary_waypoint_text(request, profile)
     mode_labels = {
         'driving': '自驾',
         'walking': '步行',
@@ -1552,12 +1584,12 @@ def _build_summary(
         'bicycling': '骑行',
     }
     hotel_preview = '；'.join(
-        f"{item.get('name')}{f'（{item.get('address')}）' if item.get('address') else ''}"
+        f"{item.get('name')}（{item.get('address')}）" if item.get('address') else str(item.get('name'))
         for item in (hotel_candidates or [])[:2]
         if item.get('name')
     )
     food_preview = '；'.join(
-        f"{item.get('name')}{f'（{item.get('address')}）' if item.get('address') else ''}"
+        f"{item.get('name')}（{item.get('address')}）" if item.get('address') else str(item.get('name'))
     for item in (food_candidates or [])[:3]
         if item.get('name')
     )
@@ -1710,6 +1742,21 @@ def _pick_nearby_candidate(candidates: list[dict[str, str]], anchor_location: st
     return candidates[day_index % len(candidates)]
 
 
+def _filter_candidates_for_city(candidates: list[dict[str, str]], city: str) -> list[dict[str, str]]:
+    city_clean = _clean_city(city)
+    if not city_clean:
+        return candidates
+    matched: list[dict[str, str]] = []
+    for item in candidates:
+        combined = ' '.join(str(item.get(key) or '') for key in ('name', 'address', 'category'))
+        mentioned_cities = [_clean_city(city_hint) for city_hint in _CITY_HINTS if city_hint in combined]
+        if mentioned_cities and city_clean not in mentioned_cities:
+            continue
+        if city_clean in combined or not mentioned_cities:
+            matched.append(item)
+    return matched
+
+
 def _build_meal_and_hotel_notes(
     city: str,
     morning_poi: dict[str, str] | None,
@@ -1722,9 +1769,9 @@ def _build_meal_and_hotel_notes(
     lunch_anchor = afternoon_poi or morning_poi
     dinner_anchor = evening_poi or afternoon_poi or morning_poi
     hotel_anchor = evening_poi or afternoon_poi or morning_poi
-    lunch_options = food_candidates or []
-    dinner_options = food_candidates or []
-    hotel_options = hotel_candidates or []
+    lunch_options = _filter_candidates_for_city(food_candidates or [], city)
+    dinner_options = _filter_candidates_for_city(food_candidates or [], city)
+    hotel_options = _filter_candidates_for_city(hotel_candidates or [], city)
     lunch = _pick_nearby_candidate(lunch_options, (lunch_anchor or {}).get('location'), day_index)
     dinner = _pick_nearby_candidate(dinner_options, (dinner_anchor or {}).get('location'), day_index + 1)
     hotel = _pick_nearby_candidate(hotel_options, (hotel_anchor or {}).get('location'), day_index)
@@ -1735,15 +1782,18 @@ def _build_meal_and_hotel_notes(
     if lunch_label:
         notes.append(f'午餐建议靠近{(lunch_anchor or {}).get("name") or "上午/下午景点"}：{lunch_label}。')
     else:
-        notes.append('午餐建议选择上午景点与下午景点之间 1-2 公里范围内的本地餐厅，减少折返。')
+        lunch_anchor_name = (lunch_anchor or {}).get('name') or f'{city}核心游览区'
+        notes.append(f'午餐建议靠近{lunch_anchor_name}或{city}地铁/打车接驳方便区域，选择本地菜或简餐，减少折返。')
     if dinner_label:
         notes.append(f'晚餐建议靠近{(dinner_anchor or {}).get("name") or "傍晚景点"}：{dinner_label}。')
     else:
-        notes.append('晚餐建议放在傍晚景点或住宿点附近，方便结束后休息。')
+        dinner_anchor_name = (dinner_anchor or {}).get('name') or f'{city}住宿点'
+        notes.append(f'晚餐建议放在{dinner_anchor_name}或{city}住宿区域附近，方便结束后休息。')
     if hotel_label:
         notes.append(f'住宿建议靠近当天收尾景点：{hotel_label}。')
     else:
-        notes.append('住宿建议选择当天收尾景点附近或公共交通换乘方便的商圈。')
+        hotel_anchor_name = (hotel_anchor or {}).get('name') or f'{city}核心景点'
+        notes.append(f'住宿建议选择{hotel_anchor_name}附近或{city}公共交通换乘方便的商圈。')
     return notes
 
 
@@ -1897,7 +1947,7 @@ def select_unique_day_pois(
     used_names: set[str],
     used_buckets_by_day: set[str],
     max_count: int,
-    allow_repeat_must_visit: bool = True,
+    allow_repeat_must_visit: bool = False,
 ) -> list[dict[str, str]]:
     selected: list[dict[str, str]] = []
     local_identities: set[str] = set()
@@ -1930,6 +1980,226 @@ def select_unique_day_pois(
     return selected
 
 
+def _candidate_scope_text(candidate: dict[str, Any]) -> str:
+    return ' '.join(str(candidate.get(key) or '') for key in ('name', 'title', 'address', 'category', 'stop_name'))
+
+
+def _route_stop_scope_names(profile: dict[str, Any], route_context: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    for source in (profile.get('route_stops') or [], route_context.get('route_stops') or []):
+        if not isinstance(source, list):
+            continue
+        for item in source:
+            if not isinstance(item, dict):
+                continue
+            name = _clean_city(str(item.get('name') or ''))
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
+def _is_wrong_stage_poi(candidate: dict[str, Any], anchor_city: str, stage: str, profile: dict[str, Any], route_context: dict[str, Any]) -> bool:
+    if stage != 'destination':
+        return False
+    anchor = _clean_city(anchor_city)
+    combined = _candidate_scope_text(candidate)
+    for stop_name in _route_stop_scope_names(profile, route_context):
+        if stop_name and stop_name != anchor and stop_name in combined:
+            return True
+    return False
+
+
+def _filter_day_scope_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    anchor_city: str,
+    stage: str,
+    profile: dict[str, Any],
+    route_context: dict[str, Any],
+) -> list[dict[str, Any]]:
+    scoped: list[dict[str, Any]] = []
+    for item in candidates:
+        if _is_wrong_stage_poi(item, anchor_city, stage, profile, route_context):
+            continue
+        if not is_poi_in_planning_scope(item, anchor_city, {**route_context, 'stage': stage}, profile):
+            continue
+        scoped.append(item)
+    return scoped
+
+
+def _is_long_intercity_transfer(transport_block: dict[str, Any] | None) -> bool:
+    if not transport_block:
+        return False
+    origin = _clean_city(str(transport_block.get('origin') or ''))
+    destination = _clean_city(str(transport_block.get('destination') or ''))
+    try:
+        total_minutes = int(transport_block.get('total_minutes') or 0)
+    except (TypeError, ValueError):
+        total_minutes = 0
+    return bool(origin and destination and origin != destination and total_minutes >= 180)
+
+
+def _is_required_poi(poi: dict[str, Any], must_visit_names: list[str]) -> bool:
+    name = str(poi.get('name') or poi.get('title') or '')
+    source = str(poi.get('source') or poi.get('data_source') or '')
+    return bool(
+        name in must_visit_names
+        or bool(poi.get('must_visit'))
+        or str(poi.get('must_visit')).lower() == 'true'
+        or source in {'user_waypoint', 'user_required'}
+    )
+
+
+def _format_attraction_output(item: dict[str, Any], must_visit_names: list[str]) -> dict[str, str]:
+    return {
+        'name': str(item.get('name') or item.get('title') or ''),
+        'address': str(item.get('address') or ''),
+        'category': str(item.get('category') or ''),
+        'reason': str(item.get('reason') or item.get('reason_hint') or ('用户指定必去，已纳入当日行程。' if _is_required_poi(item, must_visit_names) else '')),
+        'tags': str(item.get('tags') or ''),
+        'must_visit': 'true' if str(item.get('must_visit')).lower() == 'true' or str(item.get('name') or '') in must_visit_names else 'false',
+    }
+
+
+def _reservation_tip_for_attraction(item: dict[str, Any]) -> str | None:
+    name = str(item.get('name') or item.get('title') or '').strip()
+    category = str(item.get('category') or item.get('type') or '')
+    if not name:
+        return None
+    if '浙江省博物馆' in name:
+        return '浙江省博物馆建议提前预约，并确认开放时间、展馆和闭馆日。'
+    if '灵隐寺' in name:
+        return '灵隐寺建议提前查看门票、寺院开放时间和预约购票要求。'
+    if '西湖' in name:
+        return '西湖为开放式景区，通常无需整体门票；游船、展馆或热门项目建议提前确认。'
+    if '河坊街' in name:
+        return '河坊街通常无需预约，节假日建议避开客流高峰并预留用餐排队时间。'
+    if any(token in f'{name}{category}' for token in ('博物馆', '美术馆', '纪念馆', '科技馆', '展览馆')):
+        return f'{name}建议提前预约，并注意闭馆日和入馆时段。'
+    return None
+
+
+def _build_reservation_tips(items: list[dict[str, Any]]) -> list[str]:
+    return _dedupe_text([tip for tip in (_reservation_tip_for_attraction(item) for item in items) if tip])
+
+
+def _is_relaxed_family_context(profile: dict[str, Any], preferences: str) -> bool:
+    combined = f"{profile.get('companions') or ''} {preferences} {' '.join(str(item) for item in profile.get('avoid_tags') or [])}"
+    return bool(
+        profile.get('pace') == 'relaxed'
+        and any(token in combined for token in ('老人', '长辈', '小朋友', '孩子', '亲子', '少走路', '不爬山'))
+    )
+
+
+def _build_backup_attractions(
+    *,
+    candidates: list[dict[str, Any]],
+    selected_pois: list[dict[str, Any]],
+    must_visit_names: list[str],
+    stage: str,
+    anchor_city: str,
+    reason: str,
+    max_count: int = 3,
+) -> list[dict[str, str]]:
+    selected_names = {str(item.get('name') or item.get('title') or '') for item in selected_pois}
+    backup: list[dict[str, str]] = []
+    for candidate in candidates:
+        name = str(candidate.get('name') or candidate.get('title') or '')
+        if not name or name in selected_names or any(item['name'] == name for item in backup):
+            continue
+        source = str(candidate.get('source') or candidate.get('data_source') or '')
+        requested_route_item = stage == 'route' and source in {'user_waypoint', 'user_required'}
+        requested_destination_item = stage == 'destination' and source == 'user_waypoint' and not _is_required_poi(candidate, must_visit_names)
+        if not (requested_route_item or requested_destination_item):
+            continue
+        output = _format_attraction_output(candidate, must_visit_names)
+        output['reason'] = reason.format(name=name, city=anchor_city)
+        backup.append(output)
+        if len(backup) >= max_count:
+            break
+    return backup
+
+
+def _transport_totals_from_context(route_context: dict[str, Any]) -> dict[str, Any]:
+    stage_segments = route_context.get('stage_segments') if isinstance(route_context.get('stage_segments'), list) else []
+    total_transport_minutes = 0
+    total_intercity_minutes = 0
+    summaries: list[str] = []
+    for segment in stage_segments:
+        if not isinstance(segment, dict):
+            continue
+        block = segment.get('transport_block') if isinstance(segment.get('transport_block'), dict) else {}
+        try:
+            minutes = int(block.get('total_minutes') or segment.get('transport_minutes') or segment.get('drive_minutes') or 0)
+        except (TypeError, ValueError):
+            minutes = 0
+        total_transport_minutes += minutes
+        origin = _clean_city(str(block.get('origin') or segment.get('origin') or ''))
+        destination = _clean_city(str(block.get('destination') or segment.get('destination') or ''))
+        if origin and destination and origin != destination:
+            total_intercity_minutes += minutes
+        summary = str(block.get('summary') or '')
+        route_segment = str(segment.get('route_segment') or '')
+        if summary:
+            summaries.append(f'{route_segment}：{summary}' if route_segment else summary)
+    return {
+        'total_transport_minutes': total_transport_minutes,
+        'total_intercity_minutes': total_intercity_minutes,
+        'segment_transport_summary': _dedupe_text(summaries),
+        'total_transport_duration': _format_duration_minutes(total_transport_minutes) if total_transport_minutes else '',
+        'total_intercity_duration': _format_duration_minutes(total_intercity_minutes) if total_intercity_minutes else '',
+    }
+
+
+def _collect_itinerary_outputs(profile: dict[str, Any], daily_itinerary: list[TripDayPlan]) -> dict[str, Any]:
+    scheduled_names = {str(item.get('name')) for day in daily_itinerary for item in day.attractions if item.get('name')}
+    backup_items: list[dict[str, str]] = []
+    for day in daily_itinerary:
+        for item in day.backup_attractions:
+            name = str(item.get('name') or '')
+            if name and name not in scheduled_names and not any(existing.get('name') == name for existing in backup_items):
+                backup_items.append(dict(item))
+    backup_names = {str(item.get('name')) for item in backup_items if item.get('name')}
+    must_visit_attractions = [str(item) for item in profile.get('must_visit_attractions') or [] if str(item).strip()]
+    unscheduled_waypoints = [name for name in must_visit_attractions if name not in scheduled_names and name not in backup_names]
+    for item in profile.get('waypoint_details') or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get('name') or '').strip()
+        if not name or name in scheduled_names or name in backup_names:
+            continue
+        backup_items.append(
+            {
+                'name': name,
+                'address': '',
+                'category': str(item.get('type') or ''),
+                'reason': f'{name}为用户明确提到的途经/景点，未能放入主线时建议作为备选或延长停留。',
+                'tags': '用户指定备选',
+                'must_visit': 'true' if name in must_visit_attractions else 'false',
+            }
+        )
+        backup_names.add(name)
+    reservation_tips = _dedupe_text([tip for day in daily_itinerary for tip in day.reservation_tips])
+    return {
+        'scheduled_names': scheduled_names,
+        'backup_waypoints': backup_items,
+        'unscheduled_waypoints': unscheduled_waypoints,
+        'reservation_tips': reservation_tips,
+        'must_visit_attractions': must_visit_attractions,
+    }
+
+
+def _scheduled_attraction_names(daily_itinerary: list[TripDayPlan]) -> list[str]:
+    return _dedupe_text(
+        [
+            str(item.get('name') or '')
+            for day in daily_itinerary
+            for item in day.attractions
+            if isinstance(item, dict) and item.get('name')
+        ]
+    )
+
+
 def _candidate_pois_for_day(
     *,
     anchor_city: str,
@@ -1942,6 +2212,8 @@ def _candidate_pois_for_day(
 ) -> list[dict[str, str]]:
     source_key = 'route_candidates' if stage == 'route' else 'destination_candidates'
     candidates: list[dict[str, str]] = []
+    stage_counts = route_context.get('stage_counts') if isinstance(route_context.get('stage_counts'), dict) else {}
+    route_days = int(stage_counts.get('route_days') or 0) if isinstance(stage_counts, dict) else 0
     for item in (ranked_pois or {}).get(source_key, []) or []:
         name = str(item.get('name') or '').strip()
         if not name or name in used_attractions:
@@ -1949,8 +2221,16 @@ def _candidate_pois_for_day(
         if stage == 'route':
             item_stage_day = int(item.get('stage_day') or stage_day)
             stop_name = str(item.get('stop_name') or item.get('name') or '')
-            if item_stage_day != stage_day and _clean_city(stop_name) != _clean_city(anchor_city):
+            can_fold_extra_route_stop = bool(
+                route_days
+                and stage_day == route_days
+                and item_stage_day > route_days
+                and str(item.get('source') or item.get('data_source') or '') in {'user_waypoint', 'user_required'}
+            )
+            if item_stage_day != stage_day and _clean_city(stop_name) != _clean_city(anchor_city) and not can_fold_extra_route_stop:
                 continue
+        if _is_wrong_stage_poi(item, anchor_city, stage, profile, route_context):
+            continue
         if not is_valid_attraction_poi(item):
             continue
         if not is_poi_in_planning_scope(item, anchor_city, {**route_context, 'stage': stage}, profile):
@@ -1960,6 +2240,8 @@ def _candidate_pois_for_day(
         for item in fetch_destination_poi_candidates(anchor_city, profile, {**route_context, 'stage': stage}):
             name = str(item.get('name') or '').strip()
             if not name or name in used_attractions or any(existing.get('name') == name for existing in candidates):
+                continue
+            if _is_wrong_stage_poi(item, anchor_city, stage, profile, route_context):
                 continue
             if is_valid_attraction_poi(item) and is_poi_in_planning_scope(item, anchor_city, {**route_context, 'stage': stage}, profile):
                 candidates.append({key: str(value) for key, value in item.items() if value is not None})
@@ -2193,13 +2475,19 @@ def _build_trip_itinerary(
         route_segment = str(day_context.get('route_segment') or '')
         segment_data_source = str(day_context.get('segment_data_source') or 'fallback_estimated')
         transport_block = day_context.get('transport_block') if isinstance(day_context.get('transport_block'), dict) else None
+        is_long_transfer_day = _is_long_intercity_transfer(transport_block)
         if stage == 'buffer':
             recommended_spots = min(recommended_spots, 1)
+        if is_long_transfer_day:
+            recommended_spots = min(recommended_spots, 1)
+        relaxed_family_context = _is_relaxed_family_context(profile, preferences)
         effective_weather = _effective_weather_day(weather_context, weather_day)
         weather_badge = weather_badge_for_day(weather_context, weather_day)
         raw_weather_tags = [str(item) for item in (weather_day or {}).get('weather_tags', [])] if isinstance((weather_day or {}).get('weather_tags'), list) else []
         is_rain_weather = weather_badge in {'雨天', '预警'} or 'rain' in raw_weather_tags
         is_heat_weather = weather_badge == '高温' or 'heat' in raw_weather_tags or 'sun_exposure' in raw_weather_tags
+        if stage == 'destination' and relaxed_family_context and not is_long_transfer_day:
+            recommended_spots = min(recommended_spots, 2)
         weather_summary = build_daily_weather_brief(weather_context, weather_day)
         daily_weather_adjustments = build_daily_weather_adjustments(weather_context, weather_day)
         day_candidate_pois = _candidate_pois_for_day(
@@ -2211,7 +2499,19 @@ def _build_trip_itinerary(
             route_context=route_context,
             used_attractions=used_attractions,
         )
-        candidate_pois = day_candidate_pois or base_attraction_pois
+        if day_candidate_pois:
+            candidate_pois = day_candidate_pois
+        elif stage == 'route':
+            candidate_pois = []
+        else:
+            candidate_pois = base_attraction_pois
+            candidate_pois = _filter_day_scope_candidates(
+                candidate_pois,
+                anchor_city=anchor_city,
+                stage=stage,
+                profile=profile,
+                route_context=route_context,
+            )
         if effective_weather:
             weather_score_context = {**route_context, **day_context, 'stage': stage, 'weather_day': effective_weather}
             candidate_pois = sorted(
@@ -2219,6 +2519,14 @@ def _build_trip_itinerary(
                 key=lambda item: float(score_poi(dict(item), profile, weather_score_context).get('final_score') or 0),
                 reverse=True,
             )
+        candidate_pois = sorted(
+            candidate_pois,
+            key=lambda item: (
+                1 if _is_required_poi(dict(item), must_visit_names) else 0,
+                float(item.get('score') or score_poi(dict(item), profile, {**route_context, **day_context, 'stage': stage, 'weather_day': effective_weather}).get('final_score') or 0),
+            ),
+            reverse=True,
+        )
         used_buckets_by_day: set[str] = set()
         selected_pois = select_unique_day_pois(
             anchor_city=anchor_city,
@@ -2228,12 +2536,20 @@ def _build_trip_itinerary(
             used_buckets_by_day=used_buckets_by_day,
             max_count=recommended_spots,
         )
+        backup_attractions = _build_backup_attractions(
+            candidates=candidate_pois,
+            selected_pois=selected_pois,
+            must_visit_names=must_visit_names,
+            stage=stage,
+            anchor_city=anchor_city,
+            reason='{name}因当天转场、天气或轻松节奏限制未放入主线，建议作为{city}当日备选或延长停留。',
+        )
         morning_poi = selected_pois[0] if len(selected_pois) >= 1 else None
         afternoon_poi = selected_pois[1] if len(selected_pois) >= 2 else None
         evening_poi = selected_pois[2] if len(selected_pois) >= 3 else None
         if not drive_today:
             drive_today = drive_segments[min(day - 1, len(drive_segments) - 1)] if drive_segments else 0
-        if stage == 'destination':
+        if stage == 'destination' and not is_long_transfer_day:
             drive_today = min(drive_today, 45)
         elif stage == 'buffer':
             drive_today = min(drive_today, 90)
@@ -2252,7 +2568,7 @@ def _build_trip_itinerary(
         transfer_2 = 20 if afternoon_poi and evening_poi and move_2 is not None and move_2 < 0.03 else 35 if afternoon_poi and evening_poi else 0
         move_1_text = '两点距离较近，建议步行或短途接驳。' if transfer_1 == 20 else '两点之间建议预留 30-40 分钟交通切换。' if transfer_1 else ''
         move_2_text = '傍晚景点与下午景点衔接紧凑，可减少折返。' if transfer_2 == 20 else '晚间景点建议根据体力决定是否保留。' if transfer_2 else ''
-        meal_hotel_notes = _build_meal_and_hotel_notes(anchor_city, morning_poi, afternoon_poi, evening_poi, None, None, day - 1)
+        meal_hotel_notes = _build_meal_and_hotel_notes(anchor_city, morning_poi, afternoon_poi, evening_poi, hotel_candidates, food_candidates, day - 1)
         stage_score_context = {**route_context, **day_context, 'stage': stage, 'weather_day': effective_weather}
         day_attractions = []
         for poi in (morning_poi, afternoon_poi, evening_poi):
@@ -2265,6 +2581,7 @@ def _build_trip_itinerary(
             rescored['reason'] = str(score['reason'])
             rescored['tags'] = '、'.join(str(tag) for tag in score.get('tags', [])) if isinstance(score.get('tags'), list) else str(rescored.get('tags') or '')
             day_attractions.append(rescored)
+        reservation_tips = _build_reservation_tips([*day_attractions, *backup_attractions])
         day_reasons = [str(item.get('reason')) for item in day_attractions if item.get('reason') and '综合匹配' not in str(item.get('reason'))]
         if not day_reasons and day_attractions:
             day_reasons = [f'{anchor_city}当天候选与{route_segment or "当日路线"}和可游览时间匹配。']
@@ -2289,24 +2606,54 @@ def _build_trip_itinerary(
         transport_mode = str((transport_block or {}).get('mode') or profile.get('intercity_mode') or request.travel_mode)
         transport_label = str((transport_block or {}).get('label') or transport_mode_label(transport_mode))
         transport_summary = str((transport_block or {}).get('summary') or '')
-        if stage == 'route' and transport_mode not in {'driving', 'walking', 'bicycling'} and drive_today >= 120:
+        use_intercity_transfer_timeline = is_long_transfer_day or (stage == 'route' and transport_mode not in {'driving', 'walking', 'bicycling'} and drive_today >= 120)
+        if use_intercity_transfer_timeline and transport_mode not in {'driving', 'walking', 'bicycling'}:
             transfer_start_hour, transfer_start_minute = 8, 0
             transfer_end_hour, transfer_end_minute = _shift_minutes(transfer_start_hour, transfer_start_minute, drive_today)
             transport_phrase = transport_summary or f'{transport_label}跨城转场约{_format_duration_minutes(drive_today)}'
-            if morning_poi:
+            transfer_route = route_segment or f'{(transport_block or {}).get("origin") or request.origin} → {(transport_block or {}).get("destination") or anchor_city}'
+            transfer_end_total = transfer_end_hour * 60 + transfer_end_minute
+            first_visit_crosses_midday = bool(morning_poi and transfer_end_total + morning_duration > 12 * 60 + 30)
+            if first_visit_crosses_midday:
+                morning_end_hour, morning_end_minute = 12, 0
+                morning = (
+                    f'{_format_time(transfer_start_hour, transfer_start_minute)}-{_format_time(morning_end_hour, morning_end_minute)} '
+                    f'上午完成{transfer_route}{transport_label}跨城转场的出发、进站候车和在途段，{transport_phrase}；不在上午强行安排景点。'
+                )
+                afternoon_start_hour, afternoon_start_minute = _shift_minutes(transfer_end_hour, transfer_end_minute, 30)
+                afternoon_end_hour, afternoon_end_minute = _shift_minutes(afternoon_start_hour, afternoon_start_minute, morning_duration)
+                if morning_poi:
+                    afternoon = (
+                        f'{_format_time(afternoon_start_hour, afternoon_start_minute)}-{_format_time(afternoon_end_hour, afternoon_end_minute)} '
+                        f'下午抵达{anchor_city}后完成出站接驳、行李安置，再前往 {morning_name}{f"（{morning_addr}）" if morning_addr else ""}，'
+                        f'建议停留 {_format_duration_minutes(morning_duration)}，{morning_note}。'
+                    )
+                else:
+                    afternoon = f'下午抵达{anchor_city}后办理出站接驳、入住或休整，不强行增加景点。'
+                if afternoon_poi:
+                    evening_start_hour, evening_start_minute = _shift_minutes(afternoon_end_hour, afternoon_end_minute, 40)
+                    evening_end_hour, evening_end_minute = _shift_minutes(evening_start_hour, evening_start_minute, min(afternoon_duration, 90))
+                    evening = (
+                        f'{_format_time(evening_start_hour, evening_start_minute)}-{_format_time(evening_end_hour, evening_end_minute)} '
+                        f'如体力允许，短时补充 {afternoon_name}{f"（{afternoon_addr}）" if afternoon_addr else ""}，建议控制在 {_format_duration_minutes(min(afternoon_duration, 90))} 内；'
+                        f'也可改为就近用餐和休息。'
+                    )
+                else:
+                    evening = '晚间以就近用餐和休息为主，避免长距离换乘后的疲劳。'
+            elif morning_poi:
                 morning_end_hour, morning_end_minute = _shift_minutes(transfer_end_hour, transfer_end_minute, morning_duration)
                 morning = (
                     f'{_format_time(transfer_start_hour, transfer_start_minute)}-{_format_time(morning_end_hour, morning_end_minute)} '
-                    f'先完成{transport_label}跨城抵达，{transport_phrase}；到达后出站接驳至 {morning_name}{f"（{morning_addr}）" if morning_addr else ""}，'
+                    f'先完成{transfer_route}{transport_label}跨城抵达，{transport_phrase}；到达后出站接驳至 {morning_name}{f"（{morning_addr}）" if morning_addr else ""}，'
                     f'建议停留 {_format_duration_minutes(morning_duration)}，{morning_note}。'
                 )
             else:
                 morning_end_hour, morning_end_minute = _shift_minutes(transfer_end_hour, transfer_end_minute, 90)
                 morning = (
                     f'{_format_time(transfer_start_hour, transfer_start_minute)}-{_format_time(morning_end_hour, morning_end_minute)} '
-                    f'先完成{transport_label}跨城抵达，{transport_phrase}；抵达{anchor_city}后办理出站接驳、补给或入住，保留轻量休整。'
+                    f'先完成{transfer_route}{transport_label}跨城抵达，{transport_phrase}；抵达{anchor_city}后办理出站接驳、补给或入住，保留轻量休整。'
                 )
-            if afternoon_poi:
+            if not first_visit_crosses_midday and afternoon_poi:
                 afternoon_start_hour, afternoon_start_minute = _shift_minutes(morning_end_hour, morning_end_minute, transfer_1 + 40)
                 afternoon_end_hour, afternoon_end_minute = _shift_minutes(afternoon_start_hour, afternoon_start_minute, afternoon_duration)
                 afternoon = (
@@ -2314,17 +2661,17 @@ def _build_trip_itinerary(
                     f'前往 {afternoon_name}{f"（{afternoon_addr}）" if afternoon_addr else ""}，建议停留 {_format_duration_minutes(afternoon_duration)}；'
                     f'该段重点考虑与车站/上午景点的衔接效率。{move_1_text}'
                 )
-            else:
+            elif not first_visit_crosses_midday:
                 afternoon_end_hour, afternoon_end_minute = _shift_minutes(morning_end_hour, morning_end_minute, 150)
                 afternoon = f'下午保留为抵达、入住或休整时间，可在{anchor_city}核心区轻量散步，不强行增加景点。'
-            if evening_poi:
+            if not first_visit_crosses_midday and evening_poi:
                 evening_start_hour, evening_start_minute = _shift_minutes(afternoon_end_hour, afternoon_end_minute, transfer_2 + 20)
                 evening_end_hour, evening_end_minute = _shift_minutes(evening_start_hour, evening_start_minute, min(evening_duration, 120))
                 evening = (
                     f'{_format_time(evening_start_hour, evening_start_minute)}-{_format_time(evening_end_hour, evening_end_minute)} '
                     f'视体力补充 {evening_name}{f"（{evening_addr}）" if evening_addr else ""}，建议停留 {_format_duration_minutes(min(evening_duration, 120))}；{evening_note}。{move_2_text}'
                 )
-            else:
+            elif not first_visit_crosses_midday:
                 evening = '晚间以就近用餐和休息为主，避免长距离换乘后的疲劳。'
         elif stage == 'route' and request.travel_mode == 'driving' and drive_today >= 180:
             drive_start_hour, drive_start_minute = 8, 0
@@ -2479,6 +2826,8 @@ def _build_trip_itinerary(
             transfer_note,
             route_time_note,
             f'当天包含用户指定途经点/必去景点：{"、".join(required_today)}。' if required_today else '',
+            f'备选/未排入主线：{"、".join(item["name"] for item in backup_attractions)}；建议根据天气、体力或延长停留取舍。' if backup_attractions else '',
+            f'预约提醒：{"；".join(reservation_tips)}' if reservation_tips else '',
             *stage_notes,
         ]
         notes = _dedupe_text([note for note in notes if note])
@@ -2511,16 +2860,11 @@ def _build_trip_itinerary(
                 afternoon=afternoon,
                 evening=evening,
                 attractions=[
-                    {
-                        'name': item.get('name', ''),
-                        'address': item.get('address', ''),
-                        'category': item.get('category', ''),
-                        'reason': item.get('reason', '') or ('用户指定必去，已纳入当日行程。' if str(item.get('must_visit')).lower() == 'true' else ''),
-                        'tags': item.get('tags', ''),
-                        'must_visit': 'true' if str(item.get('must_visit')).lower() == 'true' else 'false',
-                    }
+                    _format_attraction_output(item, must_visit_names)
                     for item in day_attractions[:recommended_spots]
                 ],
+                backup_attractions=backup_attractions,
+                reservation_tips=reservation_tips,
                 meals=meal_notes,
                 hotel_hint=hotel_note,
                 recommendation_reasons=_dedupe_text(day_reasons)[:3],
@@ -2563,7 +2907,7 @@ def _build_trip_content(
     if request.waypoints:
         travel_tips.append(f'途经点可作为去程或返程中途停留：{"、".join(w.name for w in request.waypoints)}。')
     overview = f'这是一个面向真实游玩的{destination}{duration_days}天行程规划，核心围绕经典景点的实际游览时长、景点间距离和每日天气变化来安排先后顺序；优先保证景点本身的完整体验，而不是以餐厅和住宿作为主线。'
-    budget_summary = '已移除预算建议，当前重点保留景点、交通和天气策略。'
+    budget_summary = ''
     return overview, budget_summary, transportation_suggestion, weather_hint, attraction_recommendations, travel_tips, accommodation_suggestion
 
 
@@ -2627,15 +2971,24 @@ def compose_travel_plan(
     )
     if daily_itinerary is None:
         daily_itinerary = build_daily_itinerary(request, profile, route_context, ranked_pois, route_options, weather_hint, hotel_candidates, food_candidates)
+    scheduled_attraction_names = _scheduled_attraction_names(daily_itinerary)
+    if scheduled_attraction_names:
+        attraction_recommendations = _dedupe_text([*scheduled_attraction_names, *attraction_recommendations])
+        summary = f'{summary}\n每日核心景点：{"；".join(scheduled_attraction_names[:8])}'
     weather_plan_summary = build_weather_plan_summary(weather_context, daily_itinerary)
     if weather_plan_summary.get('weather_overview'):
         summary = f'{summary}\n天气融入：{weather_plan_summary["weather_overview"]}'
         trip_overview = f'{trip_overview} 天气融入：{weather_plan_summary["weather_overview"]}'
-    scheduled_names = {str(item.get('name')) for day in daily_itinerary for item in day.attractions if item.get('name')}
-    must_visit_attractions = [str(item) for item in profile.get('must_visit_attractions') or [] if str(item).strip()]
-    unscheduled_waypoints = [name for name in must_visit_attractions if name not in scheduled_names]
+    itinerary_outputs = _collect_itinerary_outputs(profile, daily_itinerary)
+    must_visit_attractions = itinerary_outputs['must_visit_attractions']
+    unscheduled_waypoints = itinerary_outputs['unscheduled_waypoints']
+    backup_waypoints = itinerary_outputs['backup_waypoints']
+    reservation_tips = itinerary_outputs['reservation_tips']
+    transport_totals = _transport_totals_from_context(route_context)
     if unscheduled_waypoints:
         travel_tips.append(f'以下用户指定地点未能放入每日主行程，建议作为备选或延长停留：{"、".join(unscheduled_waypoints)}。')
+    if backup_waypoints:
+        travel_tips.append(f'以下用户提到的地点可作为备选或短暂停留：{"、".join(item["name"] for item in backup_waypoints)}。')
     history = [
         ConversationTurn(user_input=str(item.get('user_input') or ''), assistant_output=str(item.get('assistant_output') or ''))
         for item in short_term[-10:]
@@ -2652,7 +3005,7 @@ def compose_travel_plan(
         summary=summary,
         route_title=f'{request.origin} → {request.destination} 旅游规划方案',
         trip_type=str(profile.get('trip_type') or 'destination_trip'),
-        route_total_duration=str(route_context.get('route_total_duration') or best_option.duration),
+        route_total_duration=str(transport_totals.get('total_transport_duration') or route_context.get('route_total_duration') or best_option.duration),
         route_total_distance=str(route_context.get('route_total_distance') or best_option.distance),
         trip_overview=trip_overview,
         duration_days=int(profile.get('duration_days') or 3),
@@ -2708,6 +3061,9 @@ def compose_travel_plan(
             'must_visit_attractions': must_visit_attractions,
             'waypoint_order_mode': profile.get('waypoint_order_mode', 'unspecified'),
             'unscheduled_waypoints': unscheduled_waypoints,
+            'backup_waypoints': backup_waypoints,
+            'reservation_tips': reservation_tips,
+            **transport_totals,
             'trip_profile': profile,
             'route_context': route_context,
             'weather_context': weather_context,
@@ -2792,15 +3148,24 @@ def build_travel_plan(request: TravelPlanRequest, memory_store_override: RedisMe
         food_candidates,
     )
     daily_itinerary = _build_trip_itinerary(request, profile, best_option, attraction_recommendations, weather_hint, route_context, hotel_candidates, food_candidates, ranked_pois)
+    scheduled_attraction_names = _scheduled_attraction_names(daily_itinerary)
+    if scheduled_attraction_names:
+        attraction_recommendations = _dedupe_text([*scheduled_attraction_names, *attraction_recommendations])
+        summary = f'{summary}\n每日核心景点：{"；".join(scheduled_attraction_names[:8])}'
     weather_plan_summary = build_weather_plan_summary(weather_context, daily_itinerary)
     if weather_plan_summary.get('weather_overview'):
         summary = f'{summary}\n天气融入：{weather_plan_summary["weather_overview"]}'
         trip_overview = f'{trip_overview} 天气融入：{weather_plan_summary["weather_overview"]}'
-    scheduled_names = {str(item.get('name')) for day in daily_itinerary for item in day.attractions if item.get('name')}
-    must_visit_attractions = [str(item) for item in profile.get('must_visit_attractions') or [] if str(item).strip()]
-    unscheduled_waypoints = [name for name in must_visit_attractions if name not in scheduled_names]
+    itinerary_outputs = _collect_itinerary_outputs(profile, daily_itinerary)
+    must_visit_attractions = itinerary_outputs['must_visit_attractions']
+    unscheduled_waypoints = itinerary_outputs['unscheduled_waypoints']
+    backup_waypoints = itinerary_outputs['backup_waypoints']
+    reservation_tips = itinerary_outputs['reservation_tips']
+    transport_totals = _transport_totals_from_context(route_context)
     if unscheduled_waypoints:
         travel_tips.append(f'以下用户指定地点未能放入每日主行程，建议作为备选或延长停留：{"、".join(unscheduled_waypoints)}。')
+    if backup_waypoints:
+        travel_tips.append(f'以下用户提到的地点可作为备选或短暂停留：{"、".join(item["name"] for item in backup_waypoints)}。')
     history = [
         ConversationTurn(user_input=str(item.get('user_input') or ''), assistant_output=str(item.get('assistant_output') or ''))
         for item in short_term[-10:]
@@ -2817,7 +3182,7 @@ def build_travel_plan(request: TravelPlanRequest, memory_store_override: RedisMe
         summary=summary,
         route_title=f'{request.origin} → {request.destination} 旅游规划方案',
         trip_type=str(profile.get('trip_type') or 'destination_trip'),
-        route_total_duration=str(route_context.get('route_total_duration') or best_option.duration),
+        route_total_duration=str(transport_totals.get('total_transport_duration') or route_context.get('route_total_duration') or best_option.duration),
         route_total_distance=str(route_context.get('route_total_distance') or best_option.distance),
         trip_overview=trip_overview,
         duration_days=int(profile['duration_days']),
@@ -2873,6 +3238,9 @@ def build_travel_plan(request: TravelPlanRequest, memory_store_override: RedisMe
             'must_visit_attractions': must_visit_attractions,
             'waypoint_order_mode': profile.get('waypoint_order_mode', 'unspecified'),
             'unscheduled_waypoints': unscheduled_waypoints,
+            'backup_waypoints': backup_waypoints,
+            'reservation_tips': reservation_tips,
+            **transport_totals,
             'trip_profile': profile,
             'route_context': route_context,
             'weather_context': weather_context,

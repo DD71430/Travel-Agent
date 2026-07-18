@@ -5,6 +5,7 @@ import mimetypes
 import re
 from pathlib import Path
 
+from docx import Document
 from fastapi import UploadFile
 from pypdf import PdfReader
 
@@ -19,6 +20,7 @@ MAX_UPLOAD_BYTES = settings.max_upload_bytes
 MAX_EXTRACT_CHARS = settings.max_extract_chars
 TEXT_EXTENSIONS = {'.txt', '.md', '.csv', '.log', '.json'}
 AUDIO_EXTENSIONS = {'.mp3', '.wav', '.m4a', '.aac', '.ogg', '.webm', '.flac', '.opus', '.amr', '.3gp'}
+DOCX_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 
 
 def truncate_text(text: str, limit: int = MAX_EXTRACT_CHARS) -> str:
@@ -71,6 +73,21 @@ def extract_text_from_pdf(content: bytes) -> str:
     return ''
 
 
+def extract_text_from_docx(content: bytes) -> str:
+    document = Document(BytesIO(content))
+    parts: list[str] = []
+    for paragraph in document.paragraphs:
+        text = paragraph.text.strip()
+        if text:
+            parts.append(text)
+    for table in document.tables:
+        for row in table.rows:
+            cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+            if cells:
+                parts.append(' '.join(cells))
+    return normalize_extracted_text('\n'.join(parts))
+
+
 def _decode_plain_bytes(content: bytes) -> str:
     for encoding in ('utf-8-sig', 'utf-8', 'gb18030', 'gbk', 'big5', 'latin-1'):
         try:
@@ -113,6 +130,13 @@ def extract_upload_context(upload: UploadFile | None, content: bytes | None) -> 
         except Exception:
             logger.exception('PDF upload extraction failed')
             extraction_error = 'pdf_extract_failed'
+    elif suffix == '.docx' or content_type == DOCX_CONTENT_TYPE:
+        file_kind = 'document'
+        try:
+            extracted_text = extract_text_from_docx(content)
+        except Exception:
+            logger.exception('DOCX upload extraction failed')
+            extraction_error = 'docx_extract_failed'
     elif suffix in TEXT_EXTENSIONS or content_type.startswith('text/'):
         file_kind = 'text'
         try:

@@ -88,6 +88,17 @@ def _clean_city(value: str | None) -> str:
     return (value or '').replace('市', '').strip()
 
 
+def _route_stop_name_set(trip_profile: dict[str, Any]) -> set[str]:
+    names: set[str] = set()
+    for item in trip_profile.get('route_stops') or []:
+        if not isinstance(item, dict):
+            continue
+        name = _clean_city(str(item.get('name') or ''))
+        if name:
+            names.add(name)
+    return names
+
+
 def _combined_poi_text(poi: dict[str, Any]) -> str:
     return ' '.join(str(poi.get(key) or '') for key in ('name', 'title', 'category', 'type', 'address'))
 
@@ -215,9 +226,9 @@ def fetch_route_poi_candidates(route_stops: list[dict[str, Any]], trip_profile: 
             poi['reason_hint'] = stop.get('reason')
             candidates.append(poi)
     must_visits = [str(item) for item in trip_profile.get('must_visit_attractions') or [] if str(item).strip()]
-    destination = str(trip_profile.get('destination') or '')
+    route_stop_names = _route_stop_name_set(trip_profile)
     for name in must_visits:
-        if destination and destination in name:
+        if _clean_city(name) not in route_stop_names:
             continue
         candidates.insert(
             0,
@@ -245,25 +256,28 @@ def fetch_destination_poi_candidates(destination: str, trip_profile: dict[str, A
         for poi in _fallback_pois_for_city(destination, trip_profile, stage='destination')
         if is_valid_attraction_poi(poi) and is_poi_in_planning_scope(poi, destination, {**(route_context or {}), 'stage': 'destination'}, trip_profile)
     ]
+    route_stop_names = _route_stop_name_set(trip_profile)
     for name in [str(item) for item in trip_profile.get('must_visit_attractions') or [] if str(item).strip()]:
-        if destination in name or _clean_city(destination) in name or name.startswith(_clean_city(destination)):
-            candidates.insert(
-                0,
-                {
-                    'name': name,
-                    'address': '用户指定目的地必去景点',
-                    'category': '用户指定必去',
-                    'location': '',
-                    'stage': 'destination',
-                    'stage_day': None,
-                    'route_order': None,
-                    'estimated_minutes': 150,
-                    'must_visit': True,
-                    'source': 'user_required',
-                    'data_source': 'user_required',
-                    'reason_hint': '用户明确要求安排',
-                },
-            )
+        clean_name = _clean_city(name)
+        if clean_name in route_stop_names:
+            continue
+        candidates.insert(
+            0,
+            {
+                'name': name,
+                'address': '用户指定目的地必去景点',
+                'category': '用户指定必去',
+                'location': '',
+                'stage': 'destination',
+                'stage_day': None,
+                'route_order': None,
+                'estimated_minutes': 150,
+                'must_visit': True,
+                'source': 'user_required',
+                'data_source': 'user_required',
+                'reason_hint': '用户明确要求安排',
+            },
+        )
     return _dedupe_candidates(candidates)
 
 

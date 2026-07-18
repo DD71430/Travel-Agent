@@ -59,3 +59,13 @@ export function formatWeatherDisplayLine(planDay: WeatherDisplayPlanDay, weather
   }
   return planDay.weather_summary || `${planDay.anchor_city || '目的地'} · 天气参考`
 }
+
+export function compactWeatherItems(items?: Array<string | null | undefined>, limit = 3) {
+  const result: string[] = []
+  for (const item of items || []) {
+    const cleaned = (item || '').trim()
+    if (cleaned && !result.includes(cleaned)) result.push(cleaned)
+    if (result.length >= limit) break
+  }
+  return result
+}

@@ -1,9 +1,16 @@
 import pytest
 
 from travel_agent.agent.travel_graph import unified_graph
+from travel_agent.agent.planner import PlannerNode
 from travel_agent.models.travel import RouteOption, RouteStep, TravelPlanResponse
 from travel_agent.schemas.chat import ChatRequest
 from travel_agent.services import travel_planner
+
+
+def test_legacy_planner_keeps_commute_when_company_context_uses_subway():
+    state = PlannerNode()({'question': '从家到公司地铁怎么走'})
+
+    assert state['scenario'] == 'daily_commute'
 
 
 @pytest.mark.asyncio

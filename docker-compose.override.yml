@@ -1,0 +1,20 @@
+services:
+  travel_agent_backend:
+    build:
+      target: dev
+    command: ["uvicorn", "travel_agent.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    volumes:
+      - ./backend:/app
+
+  travel_agent_frontend:
+    build:
+      target: dev
+    command: ["npm", "run", "dev", "--", "--host", "0.0.0.0", "--port", "80"]
+    environment:
+      VITE_API_PROXY_TARGET: http://travel_agent_backend:8000
+    volumes:
+      - ./frontend:/app
+      - frontend-node-modules:/app/node_modules
+
+volumes:
+  frontend-node-modules:

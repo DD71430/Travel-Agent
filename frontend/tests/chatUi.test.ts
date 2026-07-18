@@ -37,13 +37,30 @@ const summary = buildTravelPlanChatSummary({
   duration_days: 3,
   raw_route: {
     waypoint_details: [{ name: '徐州' }],
+    weather_context: {
+      data_source: 'tencent_maps',
+      daily_weather: [
+        { day: 1, city: '徐州', weather: '多云', temperature: '24-31℃' },
+        { day: 2, city: '杭州', weather: '阵雨', temperature: '25-32℃' },
+      ],
+    },
   },
+  daily_itinerary: [
+    { day: 1, title: '第1天', anchor_city: '徐州', morning: '', afternoon: '', evening: '', attractions: [{ name: '徐州博物馆' }, { name: '云龙湖风景区' }] },
+    { day: 2, title: '第2天', anchor_city: '杭州', morning: '', afternoon: '', evening: '', attractions: [{ name: '杭州博物馆' }] },
+    { day: 3, title: '第3天', anchor_city: '杭州', morning: '', afternoon: '', evening: '', attractions: [{ name: '西湖风景名胜区' }, { name: '灵隐寺' }] },
+  ],
+  weather_overview: '未来两天有阵雨，已融入行程。',
 })
 
 assert(summary.includes('济南 → 杭州'), 'the travel chat summary should retain the route name')
 assert(summary.includes('3 天'), 'the travel chat summary should retain the trip duration')
 assert(summary.includes('徐州'), 'the travel chat summary should mention scheduled waypoints')
-assert(summary.length < 100, 'the travel chat summary should stay concise')
+assert(summary.includes('徐州博物馆'), 'the travel chat summary should show concrete day attractions')
+assert(summary.includes('西湖风景名胜区'), 'the travel chat summary should include destination attractions')
+assert(summary.includes('天气已查询'), 'the travel chat summary should state when weather was queried')
+assert(summary.includes('阵雨'), 'the travel chat summary should surface daily weather')
+assert(!summary.includes('结果面板'), 'the travel chat summary should not hide the answer behind the result panel')
 assert(!summary.includes('上午：'), 'the travel chat summary must not duplicate the full itinerary')
 
 assert(

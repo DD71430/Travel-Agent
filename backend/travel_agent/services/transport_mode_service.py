@@ -19,7 +19,7 @@ LOCAL_MODE_LABELS = {
     'transit': '市内公共交通',
     'walking': '步行',
     'bicycling': '骑行',
-    'mixed': '市内公共交通/打车',
+    'mixed': '地铁 + 打车/网约车',
     'unknown': '未指定',
 }
 
@@ -77,11 +77,16 @@ def parse_transport_modes(text: str | None, fallback_travel_mode: str | None = N
             intercity_mode = mode
             break
 
-    local_mode = 'unknown'
-    for mode, keywords in _LOCAL_KEYWORDS:
-        if _contains_any(source, keywords):
-            local_mode = mode
-            break
+    taxi_requested = _contains_any(source, ('打车', '出租车', '网约车'))
+    transit_requested = _contains_any(source, ('地铁', '公交', '公共交通', '换乘'))
+    if taxi_requested and transit_requested:
+        local_mode = 'mixed'
+    else:
+        local_mode = 'unknown'
+        for mode, keywords in _LOCAL_KEYWORDS:
+            if _contains_any(source, keywords):
+                local_mode = mode
+                break
 
     fallback_mode = fallback_travel_mode or 'driving'
     if intercity_mode == 'unknown':

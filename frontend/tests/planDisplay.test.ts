@@ -1,4 +1,4 @@
-import { limitPlanDays, replacePlanResult } from '../src/planDisplay.js'
+import { formatBackupItemsBanner, getDayDetailsSummary, limitPlanDays, replacePlanResult } from '../src/planDisplay.js'
 
 function assert(condition: unknown, message: string) {
   if (!condition) throw new Error(message)
@@ -20,3 +20,12 @@ const oldPlan = { id: 'old', daily_itinerary: itinerary }
 const newPlan = { id: 'new', daily_itinerary: itinerary.slice(0, 3) }
 const currentPlan = replacePlanResult(oldPlan, newPlan)
 assert(currentPlan === newPlan, 'an incoming plan must replace the previous plan object')
+
+assert(
+  getDayDetailsSummary({ meals: ['午餐建议靠近西湖'], hotel_hint: '住宿建议靠近湖滨' }) === '查看餐饮、住宿与调度说明',
+  'day details summary should tell users there is meal and hotel content',
+)
+assert(
+  formatBackupItemsBanner(['云龙湖']).includes('云龙湖'),
+  'backup waypoint banner should include requested but backup attractions',
+)

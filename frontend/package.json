@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
-    "test": "tsc -p tsconfig.tests.json && node .test-dist/tests/weatherDisplay.test.js && node .test-dist/tests/planDisplay.test.js && node .test-dist/tests/chatUi.test.js && node .test-dist/tests/SidebarPanel.test.js",
+    "test": "tsc -p tsconfig.tests.json && node .test-dist/tests/weatherDisplay.test.js && node .test-dist/tests/planDisplay.test.js && node .test-dist/tests/chatUi.test.js && node .test-dist/tests/SidebarPanel.test.js && node .test-dist/tests/components.test.js",
     "preview": "vite preview"
   },
   "dependencies": {
